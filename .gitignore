@@ -3,6 +3,22 @@
 *.xlsx
 *.jsonl
 *.json
+*.zst
+*.zst_blocks
+*.parquet
+*.torrent
+data/reddit/
+output/
+
+# Local copies of the original paper implementation
+01_data_collection.py
+02_self_use_classification.py
+03_side_effect_extraction.py
+04_generate_tables.py
+REDDIT_DATA_SETUP.md
+
+# Local model credentials
+.env
 
 # Python
 __pycache__/

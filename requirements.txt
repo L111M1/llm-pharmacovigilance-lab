@@ -1,0 +1,9 @@
+pandas
+numpy
+matplotlib
+openai
+python-dotenv
+scipy
+statsmodels
+zstandard
+orjson
