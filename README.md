@@ -2,6 +2,8 @@
 
 本仓库提供一条面向 Reddit 自报文本、可自定义目标药物、使用 DeepSeek 普通 API 的药物警戒分析管线。项目借鉴了论文《Self-Reported Side Effects of Semaglutide and Tirzepatide in Online Communities》的研究问题，但当前实现已经独立重写，不包含原论文的四阶段方法脚本。
 
+项目研究背景、当前状态、与原研究的差异、Study A 数据范围以及后续 HTML 汇报素材统一维护在 [`PROJECT_REPORT_SOURCE.md`](PROJECT_REPORT_SOURCE.md)。
+
 本项目的结果用于发现 Reddit 用户关心的潜在不良反应信号，不能用于证明药物因果关系，也不能解读为临床发生率。
 
 ## 当前代码
@@ -127,7 +129,38 @@ python download_reddit_data.py `
 data/reddit/targeted_comments/<subreddit>/comments/comments_for_<post_id>.jsonl
 ```
 
-每个 post 都有独立状态文件，可以按 `Ctrl+C` 停止后以原命令继续。`recalled_posts.jsonl` 记录候选 post ID、社区、时间、匹配的标准药名和原始文件位置；`drug_match_details` 还会记录原文命中词、对应别名、精确或模糊命中、编辑距离和相似度，便于检查模糊召回产生的噪声。默认只召回出现具体药名的帖子；增加 `--include-class-only` 后，也会包含只提到 `SGLT2` 或 `gliflozin` 的帖子。类别词不会参与模糊匹配。
+#### Study A：召回 posts 并下载对应 comments
+
+Study A 使用 Dapagliflozin、Empagliflozin、Canagliflozin 和 Ertugliflozin 的内置别名表，扫描已经下载的十年 posts。下面的命令只召回具体药物名称或其模糊匹配，不加入只出现 `SGLT2`/`gliflozin` 类别词的帖子。
+
+开始前建议先查看召回数量；dry run 不写 manifest，也不下载评论：
+
+```powershell
+python download_reddit_data.py `
+  --targeted-comments-from-posts data/reddit/raw_10years `
+  --output-dir data/reddit/targeted_comments `
+  --subreddits diabetes diabetes_t2 type2diabetes diabetesuk Heartfailure kidneydisease ChronicKidneyDisease IgANephropathy `
+  --start-date 2016-09-22 `
+  --end-date 2026-09-22 `
+  --dry-run
+```
+
+确认数量后，使用下面的正式命令：
+
+```powershell
+python download_reddit_data.py `
+  --targeted-comments-from-posts data/reddit/raw_10years `
+  --output-dir data/reddit/targeted_comments `
+  --subreddits diabetes diabetes_t2 type2diabetes diabetesuk Heartfailure kidneydisease ChronicKidneyDisease IgANephropathy `
+  --start-date 2016-09-22 `
+  --end-date 2026-09-22
+```
+
+dry run 和正式运行在扫描本地 posts 时都会显示实时进度条，包括按文件字节计算的总百分比、已扫描记录数、当前召回数和正在读取的文件。正式运行随后会先写入 `data/reddit/targeted_comments/recalled_posts.jsonl` 和 `recall_summary.json`，再按其中的 post ID 通过 `link_id` 下载每条帖子的完整评论线程；评论下载阶段继续显示当前 post、已下载评论数和页数。评论输出和状态文件按 post 分开保存；网络中断或手动按 `Ctrl+C` 后，重新执行完全相同的正式命令即可续跑。不要增加 `--include-class-only`，除非研究方案明确决定纳入只提到药物类别、没有具体药名的帖子。
+
+`recall_summary.json` 是后续报告的固定数据源，记录扫描文件数、范围内原始 post 数、召回总数、召回率、各社区和各目标药物的召回数、精确/模糊命中数量、具体命中词频、多药物提及帖子数以及候选帖子报告的评论总数。这里的数字仅代表药名候选召回，不能解释为本人实际用药、副作用人数或临床发生率。
+
+每个 post 都有独立状态文件，可以按 `Ctrl+C` 停止后以原命令继续。`recalled_posts.jsonl` 记录逐帖候选明细；`recall_summary.json` 保存可直接用于汇报的汇总统计；`drug_match_details` 还会记录原文命中词、对应别名、精确或模糊命中、编辑距离和相似度，便于检查模糊召回产生的噪声。默认只召回出现具体药名的帖子；增加 `--include-class-only` 后，也会包含只提到 `SGLT2` 或 `gliflozin` 的帖子。类别词不会参与模糊匹配。
 
 未来分析其他药物时，可通过 `--drug-alias-file aliases.json` 替换默认 SGLT2 别名表。JSON 格式为：
 
@@ -195,7 +228,7 @@ python deepseek_pharmacovigilance.py `
 
 ## 给后续 Agent 的工作约定
 
-如果你是继续维护该项目的 Agent，请先完整阅读本 README 和 `deepseek_pharmacovigilance.py`，再开始修改。
+如果你是继续维护该项目的 Agent，请先完整阅读本 README、`PROJECT_REPORT_SOURCE.md` 和 `deepseek_pharmacovigilance.py`，再开始修改。凡是影响研究范围、数据状态、流程、统计口径或汇报叙事的改动，都必须同步更新 `PROJECT_REPORT_SOURCE.md` 的日期、状态和变更记录。
 
 ### 修改原则
 

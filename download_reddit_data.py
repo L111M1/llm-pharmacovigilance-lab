@@ -17,7 +17,7 @@ import re
 import ssl
 import sys
 import time
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -794,6 +794,32 @@ def find_drug_matches(
     return tuple(item["canonical_drug"] for item in ordered_details), ordered_details
 
 
+def print_recall_scan_progress(
+    processed_bytes: int,
+    total_bytes: int,
+    rows_read: int,
+    recalled_count: int,
+    current_file: Path,
+    final: bool = False,
+) -> None:
+    """Render an in-place progress bar while scanning local post files."""
+    fraction = min(processed_bytes / max(total_bytes, 1), 1.0)
+    width = 28
+    completed = int(width * fraction)
+    bar = "#" * completed + "-" * (width - completed)
+    try:
+        label = f"{current_file.parent.parent.name}/{current_file.name}"
+    except IndexError:
+        label = current_file.name
+    if len(label) > 48:
+        label = "..." + label[-45:]
+    message = (
+        f"Recall [{bar}] {fraction * 100:6.2f}% | "
+        f"{rows_read:>9,} rows | {recalled_count:>6,} recalled | {label}"
+    )
+    print(message.ljust(125), end="\n" if final else "\r", flush=True)
+
+
 def recall_posts(
     posts_root: Path,
     subreddits: list[str],
@@ -801,7 +827,7 @@ def recall_posts(
     end_epoch: int,
     aliases: dict[str, list[str]],
     include_class_only: bool,
-) -> list[RecalledPost]:
+) -> tuple[list[RecalledPost], dict[str, int]]:
     posts_root = posts_root.resolve()
     if not posts_root.exists():
         raise FileNotFoundError(posts_root)
@@ -827,6 +853,8 @@ def recall_posts(
         re.IGNORECASE,
     )
     recalled: dict[str, RecalledPost] = {}
+    rows_read = 0
+    in_scope_ids: set[str] = set()
     post_files = sorted(
         path
         for path in posts_root.rglob("*.jsonl")
@@ -835,11 +863,27 @@ def recall_posts(
     if not post_files:
         raise FileNotFoundError(f"No post JSONL files found below {posts_root}")
 
+    total_bytes = sum(path.stat().st_size for path in post_files)
+    processed_bytes = 0
+    last_progress_update = 0.0
+
     for path in post_files:
-        with path.open("r", encoding="utf-8") as stream:
+        with path.open("rb") as stream:
             for line_number, line in enumerate(stream, start=1):
+                processed_bytes += len(line)
                 if not line.strip():
                     continue
+                rows_read += 1
+                now = time.monotonic()
+                if now - last_progress_update >= 0.5:
+                    print_recall_scan_progress(
+                        processed_bytes,
+                        total_bytes,
+                        rows_read,
+                        len(recalled),
+                        path,
+                    )
+                    last_progress_update = now
                 try:
                     item = json.loads(line)
                 except json.JSONDecodeError as exc:
@@ -856,6 +900,7 @@ def recall_posts(
                     or not start_epoch <= epoch < end_epoch
                 ):
                     continue
+                in_scope_ids.add(post_id)
                 text = "\n".join(
                     [
                         str(item.get("title", "")),
@@ -890,7 +935,22 @@ def recall_posts(
                         source_path=str(path),
                     ),
                 )
-    return sorted(
+        print_recall_scan_progress(
+            processed_bytes,
+            total_bytes,
+            rows_read,
+            len(recalled),
+            path,
+        )
+    print_recall_scan_progress(
+        processed_bytes,
+        total_bytes,
+        rows_read,
+        len(recalled),
+        post_files[-1],
+        final=True,
+    )
+    posts = sorted(
         recalled.values(),
         key=lambda post: (
             post.subreddit.casefold(),
@@ -898,6 +958,12 @@ def recall_posts(
             post.post_id,
         ),
     )
+    return posts, {
+        "post_files_scanned": len(post_files),
+        "rows_read": rows_read,
+        "unique_posts_in_scope": len(in_scope_ids),
+        "recalled_posts_before_limit": len(posts),
+    }
 
 
 def write_recall_manifest(posts: list[RecalledPost], output_dir: Path) -> Path:
@@ -926,16 +992,141 @@ def write_recall_manifest(posts: list[RecalledPost], output_dir: Path) -> Path:
     return path
 
 
-def print_recall_summary(posts: list[RecalledPost]) -> None:
+def write_recall_summary(
+    posts: list[RecalledPost],
+    scan_stats: dict[str, int],
+    output_dir: Path,
+    posts_root: Path,
+    subreddits: list[str],
+    start_epoch: int,
+    end_epoch: int,
+    aliases: dict[str, list[str]],
+    include_class_only: bool,
+) -> Path:
+    """Persist recall counts and matching diagnostics for later reporting."""
+    by_subreddit: dict[str, dict[str, int]] = {}
+    by_drug: Counter[str] = Counter()
+    by_drug_set: Counter[str] = Counter()
+    matched_terms: Counter[tuple[Any, ...]] = Counter()
+    posts_with_exact = 0
+    posts_with_fuzzy = 0
+    posts_with_only_fuzzy = 0
+
+    for post in posts:
+        subreddit = by_subreddit.setdefault(
+            post.subreddit,
+            {"recalled_posts": 0, "reported_comments": 0},
+        )
+        subreddit["recalled_posts"] += 1
+        subreddit["reported_comments"] += post.num_comments
+        by_drug.update(post.matched_drugs)
+        group = " + ".join(post.matched_drugs) if post.matched_drugs else "class_only"
+        by_drug_set[group] += 1
+
+        match_types = {
+            str(detail.get("match_type", "")) for detail in post.match_details
+        }
+        if "exact" in match_types:
+            posts_with_exact += 1
+        if "fuzzy" in match_types:
+            posts_with_fuzzy += 1
+        if match_types == {"fuzzy"}:
+            posts_with_only_fuzzy += 1
+        for detail in post.match_details:
+            matched_terms[
+                (
+                    detail.get("canonical_drug", ""),
+                    str(detail.get("matched_text", "")).casefold(),
+                    detail.get("matched_alias", ""),
+                    detail.get("match_type", ""),
+                    detail.get("edit_distance", 0),
+                    detail.get("similarity", 0),
+                )
+            ] += 1
+
+    in_scope = int(scan_stats.get("unique_posts_in_scope", 0))
+    total_recalled = int(scan_stats.get("recalled_posts_before_limit", len(posts)))
+    payload = {
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "interpretation": (
+            "Recall counts represent posts containing candidate target-drug "
+            "mentions. They do not represent confirmed personal use, adverse "
+            "events, exposure regimens, or clinical incidence."
+        ),
+        "parameters": {
+            "posts_root": str(posts_root.resolve()),
+            "start_date_inclusive": date_label(start_epoch),
+            "end_date_exclusive": date_label(end_epoch),
+            "subreddits": subreddits,
+            "include_class_only": include_class_only,
+            "fuzzy_min_alias_length": FUZZY_MIN_ALIAS_LENGTH,
+            "fuzzy_similarity_threshold": FUZZY_SIMILARITY_THRESHOLD,
+            "drug_aliases": aliases,
+        },
+        "scan": scan_stats,
+        "results": {
+            "recalled_posts_before_limit": total_recalled,
+            "selected_posts_written_to_manifest": len(posts),
+            "recall_rate_percent": round(100 * total_recalled / in_scope, 4)
+            if in_scope
+            else 0.0,
+            "reported_comments_for_selected_posts": sum(
+                post.num_comments for post in posts
+            ),
+            "posts_with_exact_match": posts_with_exact,
+            "posts_with_fuzzy_match": posts_with_fuzzy,
+            "posts_with_only_fuzzy_match": posts_with_only_fuzzy,
+            "class_only_posts": sum(post.class_only for post in posts),
+            "posts_with_multiple_target_drug_mentions": sum(
+                len(post.matched_drugs) > 1 for post in posts
+            ),
+        },
+        "by_subreddit": dict(sorted(by_subreddit.items())),
+        "by_target_drug": dict(sorted(by_drug.items())),
+        "by_recalled_drug_mention_set": dict(sorted(by_drug_set.items())),
+        "matched_terms": [
+            {
+                "canonical_drug": key[0],
+                "matched_text": key[1],
+                "matched_alias": key[2],
+                "match_type": key[3],
+                "edit_distance": key[4],
+                "similarity": key[5],
+                "post_count": count,
+            }
+            for key, count in sorted(
+                matched_terms.items(),
+                key=lambda item: (-item[1], item[0]),
+            )
+        ],
+    }
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / "recall_summary.json"
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8") as stream:
+        json.dump(payload, stream, ensure_ascii=False, indent=2)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+    return path
+
+
+def print_recall_summary(
+    posts: list[RecalledPost], scan_stats: dict[str, int]
+) -> None:
     by_subreddit: dict[str, int] = {}
     by_drug: dict[str, int] = {}
     for post in posts:
         by_subreddit[post.subreddit] = by_subreddit.get(post.subreddit, 0) + 1
         for drug in post.matched_drugs:
             by_drug[drug] = by_drug.get(drug, 0) + 1
+    total_recalled = int(scan_stats.get("recalled_posts_before_limit", len(posts)))
     print(
-        f"Recalled posts: {len(posts):,}; "
-        f"reported comments: {sum(post.num_comments for post in posts):,}"
+        f"Posts in scope: {int(scan_stats.get('unique_posts_in_scope', 0)):,}; "
+        f"recalled before limit: {total_recalled:,}; "
+        f"selected: {len(posts):,}; "
+        f"reported comments for selected posts: "
+        f"{sum(post.num_comments for post in posts):,}"
     )
     for subreddit, count in sorted(by_subreddit.items(), key=lambda pair: pair[0].casefold()):
         print(f"  r/{subreddit}: {count:,} posts")
@@ -1104,7 +1295,7 @@ def run_targeted_comment_mode(args: argparse.Namespace) -> None:
         raise ValueError("--start-date must be earlier than --end-date")
     subreddits = normalize_subreddits(args.subreddits)
     aliases = load_drug_aliases(args.drug_alias_file)
-    posts = recall_posts(
+    posts, scan_stats = recall_posts(
         args.targeted_comments_from_posts,
         subreddits,
         start_epoch,
@@ -1116,13 +1307,25 @@ def run_targeted_comment_mode(args: argparse.Namespace) -> None:
         if args.max_recalled_posts < 1:
             raise ValueError("--max-recalled-posts must be at least 1")
         posts = posts[: args.max_recalled_posts]
-    print_recall_summary(posts)
+    print_recall_summary(posts, scan_stats)
     if args.dry_run:
         print("Dry run: no manifest or comments were written.")
         return
     output_dir = args.output_dir.resolve()
     manifest = write_recall_manifest(posts, output_dir)
+    summary = write_recall_summary(
+        posts,
+        scan_stats,
+        output_dir,
+        args.targeted_comments_from_posts,
+        subreddits,
+        start_epoch,
+        end_epoch,
+        aliases,
+        args.include_class_only,
+    )
     print(f"Recall manifest: {manifest}")
+    print(f"Recall summary:  {summary}")
     try:
         for index, post in enumerate(posts, start=1):
             download_targeted_post_comments(
