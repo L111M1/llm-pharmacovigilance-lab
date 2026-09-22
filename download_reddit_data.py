@@ -18,11 +18,14 @@ import ssl
 import sys
 import time
 from collections import Counter, deque
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from http.client import BadStatusLine, IncompleteRead, RemoteDisconnected
 from pathlib import Path
+from threading import Event, Lock
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -77,6 +80,8 @@ DEFAULT_DRUG_ALIASES = {
 CLASS_TERMS = ["sglt2", "sglt-2", "sglt 2", "gliflozin", "gliflozins"]
 FUZZY_SIMILARITY_THRESHOLD = 0.80
 FUZZY_MIN_ALIAS_LENGTH = 7
+DEFAULT_TARGETED_COMMENT_WORKERS = 8
+MAX_TARGETED_COMMENT_WORKERS = 32
 WORD_PATTERN = re.compile(r"[a-z]+", re.IGNORECASE)
 FIELDS = {
     "posts": [
@@ -216,6 +221,25 @@ def parse_args() -> argparse.Namespace:
         "--max-recalled-posts",
         type=int,
         help="Optional cap for a targeted-comment test run.",
+    )
+    parser.add_argument(
+        "--refresh-recall",
+        action="store_true",
+        help=(
+            "Re-scan source posts and replace the saved recall manifest. "
+            "By default, formal targeted-comment reruns reuse a compatible "
+            "recalled_posts.jsonl and recall_summary.json."
+        ),
+    )
+    parser.add_argument(
+        "--targeted-comment-workers",
+        type=int,
+        default=DEFAULT_TARGETED_COMMENT_WORKERS,
+        help=(
+            "Parallel post threads for targeted comment downloads, from 1 "
+            f"to {MAX_TARGETED_COMMENT_WORKERS} "
+            f"(default: {DEFAULT_TARGETED_COMMENT_WORKERS})."
+        ),
     )
     return parser.parse_args()
 
@@ -390,25 +414,43 @@ def retry_wait_seconds(error: HTTPError, attempt: int) -> float:
     return min(2 ** min(attempt, 6) + random.random(), 60.0)
 
 
-def visible_wait(seconds: float, reason: str) -> None:
+def visible_wait(
+    seconds: float,
+    reason: str,
+    stop_event: Event | None = None,
+    wait_callback: Any = None,
+) -> bool:
     deadline = time.monotonic() + seconds
     while True:
+        if stop_event is not None and stop_event.is_set():
+            return False
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            print(" " * 100, end="\r", flush=True)
-            return
-        print(
-            f"Waiting {remaining:5.0f}s before retry: {reason[:60]}",
-            end="\r",
-            flush=True,
-        )
-        time.sleep(min(1.0, remaining))
+            if wait_callback is None:
+                print(" " * 100, end="\r", flush=True)
+            return True
+        if wait_callback is None:
+            print(
+                f"Waiting {remaining:5.0f}s before retry: {reason[:60]}",
+                end="\r",
+                flush=True,
+            )
+        else:
+            wait_callback(reason, remaining)
+        interval = min(1.0, remaining)
+        if stop_event is not None:
+            if stop_event.wait(interval):
+                return False
+        else:
+            time.sleep(interval)
 
 
 def request_items(
     endpoint: str,
     params: dict[str, Any],
     args: argparse.Namespace,
+    stop_event: Event | None = None,
+    wait_callback: Any = None,
 ) -> list[dict[str, Any]]:
     url = f"{endpoint}?{urlencode(params)}"
     request = Request(
@@ -420,19 +462,45 @@ def request_items(
     )
     attempt = 0
     while True:
+        if stop_event is not None and stop_event.is_set():
+            raise InterruptedError("Targeted comment download stopped")
         try:
             with urlopen(request, timeout=args.timeout) as response:
                 payload = json.loads(response.read().decode("utf-8"))
             return extract_items(payload)
         except HTTPError as exc:
-            retryable = exc.code == 429 or 500 <= exc.code < 600
+            try:
+                error_body = exc.read(4096).decode(
+                    "utf-8", errors="replace"
+                )
+            except (OSError, UnicodeError):
+                error_body = ""
+            normalized_error = error_body.casefold()
+            transient_422 = exc.code == 422 and (
+                "timeout" in normalized_error
+                or "slow down" in normalized_error
+            )
+            retryable = (
+                exc.code == 429
+                or 500 <= exc.code < 600
+                or transient_422
+            )
             if not retryable:
                 raise
             attempt += 1
             if args.max_retries and attempt > args.max_retries:
                 raise
             wait = retry_wait_seconds(exc, attempt - 1)
-            visible_wait(wait, f"HTTP {exc.code}")
+            reason = f"HTTP {exc.code}"
+            if transient_422:
+                reason += " transient API timeout"
+            if not visible_wait(
+                wait,
+                reason,
+                stop_event=stop_event,
+                wait_callback=wait_callback,
+            ):
+                raise InterruptedError("Targeted comment download stopped")
         except (
             URLError,
             TimeoutError,
@@ -450,7 +518,13 @@ def request_items(
                 2 ** min(attempt - 1, 6) + random.random(),
                 60.0,
             )
-            visible_wait(wait, type(exc).__name__)
+            if not visible_wait(
+                wait,
+                type(exc).__name__,
+                stop_event=stop_event,
+                wait_callback=wait_callback,
+            ):
+                raise InterruptedError("Targeted comment download stopped")
 
 
 def request_page(
@@ -492,6 +566,38 @@ def load_recent_ids(path: Path, limit: int) -> set[str]:
             if item_id:
                 recent.append(item_id)
     return set(recent)
+
+
+def load_all_ids(path: Path) -> set[str]:
+    """Load every valid record ID from one targeted comment JSONL file."""
+    ids: set[str] = set()
+    if not path.exists() or path.stat().st_size == 0:
+        return ids
+    with path.open("r", encoding="utf-8") as stream:
+        for line in stream:
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            item_id = str(item.get("id", "")).strip()
+            if item_id:
+                ids.add(item_id)
+    return ids
+
+
+def count_valid_jsonl_records(path: Path) -> int:
+    """Count complete JSON records, ignoring a possible torn final line."""
+    count = 0
+    if not path.exists() or path.stat().st_size == 0:
+        return count
+    with path.open("r", encoding="utf-8") as stream:
+        for line in stream:
+            try:
+                json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            count += 1
+    return count
 
 
 def print_progress(
@@ -1111,6 +1217,103 @@ def write_recall_summary(
     return path
 
 
+def load_saved_recall(
+    output_dir: Path,
+    posts_root: Path,
+    subreddits: list[str],
+    start_epoch: int,
+    end_epoch: int,
+    aliases: dict[str, list[str]],
+    include_class_only: bool,
+    max_recalled_posts: int | None,
+) -> tuple[list[RecalledPost], dict[str, int]] | None:
+    """Load a compatible saved manifest so comment resumes skip re-scanning."""
+    manifest_path = output_dir / "recalled_posts.jsonl"
+    summary_path = output_dir / "recall_summary.json"
+    if not manifest_path.exists() and not summary_path.exists():
+        return None
+    if not manifest_path.exists() or not summary_path.exists():
+        raise RuntimeError(
+            "Recall cache is incomplete: recalled_posts.jsonl and "
+            "recall_summary.json must either both exist or both be absent. "
+            "Restore the missing file or use --refresh-recall."
+        )
+
+    with summary_path.open("r", encoding="utf-8") as stream:
+        summary = json.load(stream)
+    parameters = summary.get("parameters", {})
+    scan_stats = summary.get("scan", {})
+    results = summary.get("results", {})
+    expected_parameters = {
+        "posts_root": str(posts_root.resolve()),
+        "start_date_inclusive": date_label(start_epoch),
+        "end_date_exclusive": date_label(end_epoch),
+        "subreddits": subreddits,
+        "include_class_only": include_class_only,
+        "fuzzy_min_alias_length": FUZZY_MIN_ALIAS_LENGTH,
+        "fuzzy_similarity_threshold": FUZZY_SIMILARITY_THRESHOLD,
+        "drug_aliases": aliases,
+    }
+    mismatches = [
+        key
+        for key, expected in expected_parameters.items()
+        if parameters.get(key) != expected
+    ]
+    total_recalled = int(scan_stats.get("recalled_posts_before_limit", 0))
+    expected_selected = (
+        total_recalled
+        if max_recalled_posts is None
+        else min(total_recalled, max_recalled_posts)
+    )
+    saved_selected = int(
+        results.get("selected_posts_written_to_manifest", -1)
+    )
+    if saved_selected != expected_selected:
+        mismatches.append("max_recalled_posts")
+    if mismatches:
+        raise RuntimeError(
+            "Saved recall parameters do not match the current command "
+            f"({', '.join(mismatches)}). Use the original parameters, choose "
+            "a different --output-dir, or pass --refresh-recall to rebuild."
+        )
+
+    posts: list[RecalledPost] = []
+    seen_ids: set[str] = set()
+    with manifest_path.open("r", encoding="utf-8") as stream:
+        for line_number, line in enumerate(stream, start=1):
+            if not line.strip():
+                continue
+            try:
+                item = json.loads(line)
+                post = RecalledPost(
+                    post_id=str(item["post_id"]),
+                    subreddit=str(item["subreddit"]),
+                    created_utc=int(item["created_utc"]),
+                    num_comments=max(int(item.get("num_comments", 0)), 0),
+                    matched_drugs=tuple(item.get("matched_target_drugs", [])),
+                    match_details=tuple(item.get("drug_match_details", [])),
+                    class_only=bool(item.get("class_only", False)),
+                    source_path=str(item.get("source_path", "")),
+                )
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise ValueError(
+                    f"Invalid saved recall manifest at line {line_number}: {exc}"
+                ) from exc
+            if not post.post_id or post.post_id in seen_ids:
+                raise ValueError(
+                    "Saved recall manifest contains an empty or duplicate "
+                    f"post_id at line {line_number}"
+                )
+            seen_ids.add(post.post_id)
+            posts.append(post)
+    if len(posts) != saved_selected:
+        raise RuntimeError(
+            f"Saved recall manifest has {len(posts):,} posts but summary "
+            f"expects {saved_selected:,}. Use --refresh-recall to rebuild."
+        )
+    return posts, {str(key): int(value) for key, value in scan_stats.items()}
+
+
 def print_recall_summary(
     posts: list[RecalledPost], scan_stats: dict[str, int]
 ) -> None:
@@ -1143,6 +1346,47 @@ def targeted_output_path(output_dir: Path, post: RecalledPost) -> Path:
         / "comments"
         / f"comments_for_{post.post_id}.jsonl"
     )
+
+
+@contextmanager
+def targeted_output_lock(output_dir: Path):
+    """Prevent two downloader processes from writing one output directory."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = output_dir / ".comment_download.lock"
+    stream = lock_path.open("a+b")
+    stream.seek(0, os.SEEK_END)
+    if stream.tell() == 0:
+        stream.write(b"\0")
+        stream.flush()
+    stream.seek(0)
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (OSError, BlockingIOError) as exc:
+        stream.close()
+        raise RuntimeError(
+            "Another targeted-comment downloader is already using "
+            f"this output directory: {output_dir}"
+        ) from exc
+    try:
+        yield
+    finally:
+        stream.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+        stream.close()
 
 
 def load_targeted_state(
@@ -1198,29 +1442,157 @@ def save_targeted_state(output_path: Path, state: dict[str, Any]) -> None:
     os.replace(temporary, state_path)
 
 
+class TargetedCommentProgress:
+    """Thread-safe aggregate progress for parallel comment downloads."""
+
+    def __init__(self, total: int, workers: int) -> None:
+        self.total = total
+        self.workers = workers
+        self.completed = 0
+        self.failed = 0
+        self.saved_comments = 0
+        self.pages_this_run = 0
+        self.active: set[str] = set()
+        self.registered: set[str] = set()
+        self.lock = Lock()
+
+    def _render(self, note: str = "") -> None:
+        fraction = min(self.completed / max(self.total, 1), 1.0)
+        width = 24
+        filled = int(width * fraction)
+        bar = "#" * filled + "-" * (width - filled)
+        suffix = f" | {note[:42]}" if note else ""
+        message = (
+            f"Comments [{bar}] {fraction * 100:6.2f}% | "
+            f"{self.completed:>4,}/{self.total:,} threads | "
+            f"{len(self.active):>2} active/{self.workers} | "
+            f"{self.saved_comments:>7,} comments | "
+            f"{self.pages_this_run:>5,} pages{suffix}"
+        )
+        print(message.ljust(155), end="\r", flush=True)
+
+    def register(self, post: RecalledPost, state: dict[str, Any]) -> None:
+        with self.lock:
+            if post.post_id in self.registered:
+                return
+            self.registered.add(post.post_id)
+            self.saved_comments += int(state.get("count", 0))
+            if state.get("complete"):
+                self.completed += 1
+            else:
+                self.active.add(post.post_id)
+            self._render(f"r/{post.subreddit} {post.post_id}")
+
+    def page_saved(
+        self,
+        post: RecalledPost,
+        state: dict[str, Any],
+        new_comments: int,
+    ) -> None:
+        with self.lock:
+            self.saved_comments += new_comments
+            self.pages_this_run += 1
+            if state.get("complete") and post.post_id in self.active:
+                self.active.remove(post.post_id)
+                self.completed += 1
+            self._render(
+                f"r/{post.subreddit} {post.post_id} "
+                f"page {int(state.get('pages', 0))}"
+            )
+
+    def retry(self, post: RecalledPost, reason: str, remaining: float) -> None:
+        with self.lock:
+            self._render(
+                f"retry {post.post_id}: {reason} ({remaining:.0f}s)"
+            )
+
+    def failure(self, post: RecalledPost, error: BaseException) -> None:
+        with self.lock:
+            self.active.discard(post.post_id)
+            self.failed += 1
+            self._render(
+                f"FAILED {post.post_id}: {type(error).__name__}"
+            )
+
+    def finish(self, stopped: bool = False) -> None:
+        with self.lock:
+            status = "stopped safely" if stopped else "finished"
+            self._render(status)
+            print()
+
+
 def download_targeted_post_comments(
     post: RecalledPost,
-    index: int,
-    total: int,
     output_dir: Path,
     start_epoch: int,
     end_epoch: int,
     args: argparse.Namespace,
+    progress: TargetedCommentProgress | None = None,
+    stop_event: Event | None = None,
 ) -> None:
     output_path = targeted_output_path(output_dir, post)
     state = load_targeted_state(output_path, post, start_epoch, end_epoch)
-    if state.get("complete") and output_path.exists():
-        print(
-            f"[{index:04d}/{total:04d}] SKIP r/{post.subreddit} "
-            f"post {post.post_id}: {int(state.get('count', 0)):,} comments"
-        )
-        return
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.touch(exist_ok=True)
+    seen_ids = load_all_ids(output_path)
+    stored_count = count_valid_jsonl_records(output_path)
+    if int(state.get("count", 0)) != stored_count:
+        state["count"] = stored_count
+        save_targeted_state(output_path, state)
+    if progress is not None:
+        progress.register(post, state)
+    if state.get("complete"):
+        if progress is None:
+            print(
+                f"SKIP r/{post.subreddit} post {post.post_id}: "
+                f"{int(state.get('count', 0)):,} comments"
+            )
+        return
     cursor = max(int(state["cursor"]), post.created_utc, start_epoch)
-    recent_ids = load_recent_ids(output_path, args.page_size * 2)
 
     while cursor < end_epoch:
+        if stop_event is not None and stop_event.is_set():
+            return
+        wait_callback = (
+            (lambda reason, remaining: progress.retry(
+                post, reason, remaining
+            ))
+            if progress is not None
+            else None
+        )
+        # Arctic Shift can return a misleading HTTP 422 timeout for an
+        # ascending query whose cursor is already beyond the newest comment.
+        # Near the end boundary, a fast descending lookup lets us prove that
+        # the saved cursor has passed the final available record and finish
+        # without repeatedly issuing the pathological empty-tail query.
+        if end_epoch - cursor <= 86_400:
+            latest_items = request_items(
+                f"{API_BASE}/comments/search",
+                {
+                    "link_id": post.post_id,
+                    "before": end_epoch,
+                    "sort": "desc",
+                    "limit": 1,
+                    "fields": "id,created_utc,link_id",
+                },
+                args,
+                stop_event=stop_event,
+                wait_callback=wait_callback,
+            )
+            latest_epochs = [
+                epoch
+                for item in latest_items
+                if (epoch := created_epoch(item)) is not None
+            ]
+            if not latest_epochs or max(latest_epochs) < cursor:
+                cursor = end_epoch
+                state["cursor"] = cursor
+                state["pages"] = int(state.get("pages", 0)) + 1
+                state["complete"] = True
+                save_targeted_state(output_path, state)
+                if progress is not None:
+                    progress.page_saved(post, state, 0)
+                break
         items = request_items(
             f"{API_BASE}/comments/search",
             {
@@ -1232,18 +1604,22 @@ def download_targeted_post_comments(
                 "fields": ",".join(FIELDS["comments"]),
             },
             args,
+            stop_event=stop_event,
+            wait_callback=wait_callback,
         )
         valid = []
         page_epochs = []
+        page_ids: set[str] = set()
         for item in items:
             epoch = created_epoch(item)
             if epoch is None or not start_epoch <= epoch < end_epoch:
                 continue
             page_epochs.append(epoch)
             item_id = str(item.get("id", "")).strip()
-            if item_id and item_id in recent_ids:
+            if not item_id or item_id in seen_ids or item_id in page_ids:
                 continue
             valid.append(item)
+            page_ids.add(item_id)
 
         if not items:
             cursor = end_epoch
@@ -1265,27 +1641,94 @@ def download_targeted_post_comments(
                     stream.write(json.dumps(item, ensure_ascii=False) + "\n")
                 stream.flush()
                 os.fsync(stream.fileno())
-        recent_ids = {
-            str(item.get("id", "")).strip()
-            for item in items
-            if str(item.get("id", "")).strip()
-        }
+        seen_ids.update(page_ids)
         state["cursor"] = cursor
         state["count"] = int(state.get("count", 0)) + len(valid)
         state["pages"] = int(state.get("pages", 0)) + 1
         state["complete"] = cursor >= end_epoch
         save_targeted_state(output_path, state)
-        print(
-            f"[{index:04d}/{total:04d}] r/{post.subreddit:<22} "
-            f"post {post.post_id:<8} | "
-            f"{int(state['count']):>5,} comments | "
-            f"page {int(state['pages']):>3}",
-            end="\r",
-            flush=True,
-        )
+        if progress is not None:
+            progress.page_saved(post, state, len(valid))
+        else:
+            print(
+                f"r/{post.subreddit:<22} post {post.post_id:<8} | "
+                f"{int(state['count']):>5,} comments | "
+                f"page {int(state['pages']):>3}",
+                end="\r",
+                flush=True,
+            )
         if cursor < end_epoch and args.request_delay:
-            time.sleep(args.request_delay)
-    print()
+            if stop_event is not None:
+                if stop_event.wait(args.request_delay):
+                    return
+            else:
+                time.sleep(args.request_delay)
+    if progress is None:
+        print()
+
+
+def download_targeted_comments_parallel(
+    posts: list[RecalledPost],
+    output_dir: Path,
+    start_epoch: int,
+    end_epoch: int,
+    args: argparse.Namespace,
+) -> None:
+    """Download independent comment threads with a bounded worker pool."""
+    progress = TargetedCommentProgress(
+        total=len(posts),
+        workers=args.targeted_comment_workers,
+    )
+    stop_event = Event()
+    failures: list[tuple[RecalledPost, BaseException]] = []
+    executor = ThreadPoolExecutor(
+        max_workers=args.targeted_comment_workers,
+        thread_name_prefix="reddit-comments",
+    )
+    futures: dict[Future[None], RecalledPost] = {}
+    try:
+        for post in posts:
+            future = executor.submit(
+                download_targeted_post_comments,
+                post,
+                output_dir,
+                start_epoch,
+                end_epoch,
+                args,
+                progress,
+                stop_event,
+            )
+            futures[future] = post
+
+        for future in as_completed(futures):
+            post = futures[future]
+            try:
+                future.result()
+            except InterruptedError:
+                if not stop_event.is_set():
+                    raise
+            except Exception as exc:
+                failures.append((post, exc))
+                progress.failure(post, exc)
+    except KeyboardInterrupt:
+        stop_event.set()
+        for future in futures:
+            future.cancel()
+        executor.shutdown(wait=True, cancel_futures=True)
+        progress.finish(stopped=True)
+        raise
+    else:
+        executor.shutdown(wait=True)
+        progress.finish()
+
+    if failures:
+        examples = "; ".join(
+            f"{post.post_id}: {type(error).__name__}: {error}"
+            for post, error in failures[:5]
+        )
+        raise RuntimeError(
+            f"{len(failures)} targeted comment thread(s) failed. {examples}"
+        )
 
 
 def run_targeted_comment_mode(args: argparse.Namespace) -> None:
@@ -1295,43 +1738,64 @@ def run_targeted_comment_mode(args: argparse.Namespace) -> None:
         raise ValueError("--start-date must be earlier than --end-date")
     subreddits = normalize_subreddits(args.subreddits)
     aliases = load_drug_aliases(args.drug_alias_file)
-    posts, scan_stats = recall_posts(
-        args.targeted_comments_from_posts,
-        subreddits,
-        start_epoch,
-        end_epoch,
-        aliases,
-        args.include_class_only,
-    )
-    if args.max_recalled_posts is not None:
-        if args.max_recalled_posts < 1:
-            raise ValueError("--max-recalled-posts must be at least 1")
-        posts = posts[: args.max_recalled_posts]
+    output_dir = args.output_dir.resolve()
+    cached = None
+    if not args.dry_run and not args.refresh_recall:
+        cached = load_saved_recall(
+            output_dir,
+            args.targeted_comments_from_posts,
+            subreddits,
+            start_epoch,
+            end_epoch,
+            aliases,
+            args.include_class_only,
+            args.max_recalled_posts,
+        )
+    if cached is not None:
+        posts, scan_stats = cached
+        print(
+            f"Using saved recall manifest: {output_dir / 'recalled_posts.jsonl'} "
+            f"({len(posts):,} posts). Use --refresh-recall to re-scan."
+        )
+    else:
+        posts, scan_stats = recall_posts(
+            args.targeted_comments_from_posts,
+            subreddits,
+            start_epoch,
+            end_epoch,
+            aliases,
+            args.include_class_only,
+        )
+        if args.max_recalled_posts is not None:
+            posts = posts[: args.max_recalled_posts]
     print_recall_summary(posts, scan_stats)
     if args.dry_run:
         print("Dry run: no manifest or comments were written.")
         return
-    output_dir = args.output_dir.resolve()
-    manifest = write_recall_manifest(posts, output_dir)
-    summary = write_recall_summary(
-        posts,
-        scan_stats,
-        output_dir,
-        args.targeted_comments_from_posts,
-        subreddits,
-        start_epoch,
-        end_epoch,
-        aliases,
-        args.include_class_only,
+    if cached is None:
+        manifest = write_recall_manifest(posts, output_dir)
+        summary = write_recall_summary(
+            posts,
+            scan_stats,
+            output_dir,
+            args.targeted_comments_from_posts,
+            subreddits,
+            start_epoch,
+            end_epoch,
+            aliases,
+            args.include_class_only,
+        )
+        print(f"Recall manifest: {manifest}")
+        print(f"Recall summary:  {summary}")
+    print(
+        f"Downloading {len(posts):,} comment threads with "
+        f"{args.targeted_comment_workers} workers. "
+        "Press Ctrl+C once to stop safely."
     )
-    print(f"Recall manifest: {manifest}")
-    print(f"Recall summary:  {summary}")
     try:
-        for index, post in enumerate(posts, start=1):
-            download_targeted_post_comments(
-                post,
-                index,
-                len(posts),
+        with targeted_output_lock(output_dir):
+            download_targeted_comments_parallel(
+                posts,
                 output_dir,
                 start_epoch,
                 end_epoch,
@@ -1353,6 +1817,13 @@ def main() -> None:
         raise ValueError("--timeout must be positive")
     if args.max_retries < 0:
         raise ValueError("--max-retries cannot be negative")
+    if args.max_recalled_posts is not None and args.max_recalled_posts < 1:
+        raise ValueError("--max-recalled-posts must be at least 1")
+    if not 1 <= args.targeted_comment_workers <= MAX_TARGETED_COMMENT_WORKERS:
+        raise ValueError(
+            "--targeted-comment-workers must be between 1 and "
+            f"{MAX_TARGETED_COMMENT_WORKERS}"
+        )
     if args.targeted_comments_from_posts is not None:
         run_targeted_comment_mode(args)
         return

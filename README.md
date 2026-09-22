@@ -11,19 +11,23 @@
 | 文件 | 作用 |
 |---|---|
 | `download_reddit_data.py` | 下载 Reddit posts，并从药物相关 posts 定向下载评论 |
-| `deepseek_pharmacovigilance.py` | 清理输入、调用 DeepSeek、识别实际用药组合、抽取症状并生成统计和图表 |
+| `pharmacovigilance_pipeline.py` | 清理输入、调用模型 API、识别实际用药组合、抽取症状并生成统计和图表 |
 
 当前已实现：
 
-- 从 CSV、JSONL 或 NDJSON 读取已爬取的 Reddit 文本。
-- 清理空文本、删除内容和重复记录。
+- 从 CSV、JSONL、NDJSON 或完整的 `targeted_comments` 目录读取 Reddit 文本。
+- 自动合并召回 posts 与定向 comments，保留讨论串关系并为 comment 生成只用于消歧的上下文。
+- 清理空文本、删除内容、缺失用户和重复记录，并将 Reddit 用户名转换为带盐 HMAC-SHA256 伪名。
 - 通过 DeepSeek 普通 Chat Completions API 进行并发抽取。
 - 使用根目录 `.env` 中的 `model_url`、`api_key` 和 `model_name`。
 - 识别作者实际使用的目标药物，并按同期用药集合拆分为单药或联合用药 regimen。
 - 对每个实际观察到的暴露组分别统计不良反应。
 - 可选地将模型提出的 MedDRA PT 与本地授权词表 `pt.asc` 做精确匹配。
 - 输出按“用户 + 暴露组 + PT”去重的频数，并为各单药组和联合用药组分别绘制前十症状图。
-- 每次运行都覆盖 `extractions.jsonl`，不使用 checkpoint，不复用任何旧模型结果。
+- 表格和图表同时输出中文、英文版；英文 MedDRA PT 作为统计主键，中文是帮助理解的辅助释义。
+- `extractions.jsonl` 是可续跑 checkpoint；只跳过已完成记录，失败或中断记录会在下次重试。
+- 用输入指纹、提示词版本、药物列表和模型配置校验 checkpoint，防止误用过期结果。
+- 并发 worker 通过队列交结果，由单一写入器逐条 `flush + fsync`；输出目录跨进程锁阻止两个任务共用同一 checkpoint。
 
 ## 当前实现状态
 
@@ -76,7 +80,7 @@ subreddit
 date
 ```
 
-`deepseek_pharmacovigilance.py` 不会自动下载 Reddit 数据。独立的 `download_reddit_data.py` 负责从 Arctic Shift API 下载原始帖子和评论。下载结果还需经过本地药名预筛和字段转换，才能作为 DeepSeek 管线的输入。
+`pharmacovigilance_pipeline.py` 不会自动下载 Reddit 数据。独立的 `download_reddit_data.py` 负责从 Arctic Shift API 下载原始帖子和评论。完成定向下载后，可直接把 `data/reddit/targeted_comments` 作为 `--input`；脚本会根据 manifest 读取原 post，合并评论，生成 `post:<id>` / `comment:<id>` 稳定记录 ID，保留 `thread_id`、`parent_id`、`source_type`、社区和时间，并对用户名做带盐伪名化。
 
 ## Reddit 数据下载
 
@@ -105,7 +109,7 @@ python download_reddit_data.py `
   --end-date 2026-09-22
 ```
 
-Arctic Shift 是免费服务，下载器默认在成功请求之间等待 0.8 秒，并对 429、5xx、超时、远端断开、连接重置、TLS 中断和响应截断做带可见倒计时的持续退避重试。不建议为了提速而把 `--request-delay` 设得过低。如果需要限制单页重试次数，可显式传入 `--max-retries N`。
+Arctic Shift 是免费服务，下载器默认在成功请求之间等待 0.8 秒，并对 429、5xx、超时、远端断开、连接重置、TLS 中断和响应截断做带可见倒计时的持续退避重试。Arctic Shift 有时会将内部超时返回为 `422 Timeout. Maybe slow down a bit`；程序仅对正文明确为 timeout/slow down 的 422 按临时错误处理，其他 422 仍立即报错。定向评论在时间窗尾部还会通过倒序查询核验最新记录，避免对已空的尾页无限重试。不建议为了提速而把 `--request-delay` 设得过低。如果需要限制单页重试次数，可显式传入 `--max-retries N`。
 
 ### 按药物相关帖子下载评论（推荐）
 
@@ -153,10 +157,17 @@ python download_reddit_data.py `
   --output-dir data/reddit/targeted_comments `
   --subreddits diabetes diabetes_t2 type2diabetes diabetesuk Heartfailure kidneydisease ChronicKidneyDisease IgANephropathy `
   --start-date 2016-09-22 `
-  --end-date 2026-09-22
+  --end-date 2026-09-22 `
+  --targeted-comment-workers 8
 ```
 
-dry run 和正式运行在扫描本地 posts 时都会显示实时进度条，包括按文件字节计算的总百分比、已扫描记录数、当前召回数和正在读取的文件。正式运行随后会先写入 `data/reddit/targeted_comments/recalled_posts.jsonl` 和 `recall_summary.json`，再按其中的 post ID 通过 `link_id` 下载每条帖子的完整评论线程；评论下载阶段继续显示当前 post、已下载评论数和页数。评论输出和状态文件按 post 分开保存；网络中断或手动按 `Ctrl+C` 后，重新执行完全相同的正式命令即可续跑。不要增加 `--include-class-only`，除非研究方案明确决定纳入只提到药物类别、没有具体药名的帖子。
+dry run 和正式运行在扫描本地 posts 时都会显示实时进度条，包括按文件字节计算的总百分比、已扫描记录数、当前召回数和正在读取的文件。正式运行随后会先写入 `data/reddit/targeted_comments/recalled_posts.jsonl` 和 `recall_summary.json`，再按其中的 post ID 通过 `link_id` 下载每条帖子的完整评论线程。
+
+定向评论下载使用有界线程池；`--targeted-comment-workers` 可设为 1–32，默认和推荐起始值为 8。每个 post ID 只会提交一次，每个 worker 独占该 post 的 JSONL 和状态文件，不会并发写同一文件。续传时会读取该帖子已保存的全部 comment ID，对历史页重叠和同页重复同时去重。输出目录还有跨进程排他锁；如果误开第二个针对同一 `--output-dir` 的下载命令，第二个会立即报错退出。总进度会显示完成线程数、活跃 worker、已保存评论数和本次页数。worker 数越高越容易触发数据源限流；建议先用 8，稳定后再尝试 12 或 16，不建议直接使用 32。
+
+评论输出和状态文件按 post 分开保存；网络中断或手动按一次 `Ctrl+C` 后，程序会停止待执行任务，并通知正在运行的 worker 在安全页边界退出。重新执行完全相同的正式命令即可续跑。不要增加 `--include-class-only`，除非研究方案明确决定纳入只提到药物类别、没有具体药名的帖子。
+
+正式续跑默认直接读取输出目录中已有的 `recalled_posts.jsonl` 和 `recall_summary.json`，不会重新扫描十年 posts。程序会核对源目录、日期、社区、别名、模糊匹配规则、class-only 设置和测试限额；参数不一致时拒绝复用并提示处理方式。只有药物召回规则或研究范围发生变化、确实需要重新生成候选集时，才在正式命令末尾增加 `--refresh-recall`。`--dry-run` 为了重新计算预览数字，仍会执行本地扫描。
 
 `recall_summary.json` 是后续报告的固定数据源，记录扫描文件数、范围内原始 post 数、召回总数、召回率、各社区和各目标药物的召回数、精确/模糊命中数量、具体命中词频、多药物提及帖子数以及候选帖子报告的评论总数。这里的数字仅代表药名候选召回，不能解释为本人实际用药、副作用人数或临床发生率。
 
@@ -172,12 +183,24 @@ dry run 和正式运行在扫描本地 posts 时都会显示实时进度条，�
 
 ## 当前运行方式
 
-先用小样本测试：
+先只执行全量本地清洗，不调用 DeepSeek：
 
 ```powershell
-python deepseek_pharmacovigilance.py `
-  --input data/reddit_posts.csv `
-  --output-dir output/test_run `
+python pharmacovigilance_pipeline.py `
+  --input data/reddit/targeted_comments `
+  --output-dir output/study_a `
+  --target-drugs dapagliflozin empagliflozin canagliflozin ertugliflozin `
+  --prepare-only
+```
+
+该命令生成 `cleaned_posts.csv` 和 `cleaning_summary.json`。首次运行还会在输出目录创建本地 `.user_hash_salt`；同一输出目录后续运行会复用它，以保持用户伪名稳定。不要公开该盐值文件。
+
+再用独立输出目录做小样本模型测试：
+
+```powershell
+python pharmacovigilance_pipeline.py `
+  --input data/reddit/targeted_comments `
+  --output-dir output/study_a_test100 `
   --target-drugs dapagliflozin empagliflozin canagliflozin ertugliflozin `
   --limit 100 `
   --concurrency 10 `
@@ -187,9 +210,9 @@ python deepseek_pharmacovigilance.py `
 确认输出无误后再扩大并发：
 
 ```powershell
-python deepseek_pharmacovigilance.py `
-  --input data/reddit_posts.csv `
-  --output-dir output/sglt2_analysis `
+python pharmacovigilance_pipeline.py `
+  --input data/reddit/targeted_comments `
+  --output-dir output/study_a `
   --target-drugs dapagliflozin empagliflozin canagliflozin ertugliflozin `
   --meddra-pt MedDRA_28_0_English/MedAscii/pt.asc `
   --concurrency 150 `
@@ -198,20 +221,35 @@ python deepseek_pharmacovigilance.py `
 
 `--meddra-pt` 是可选参数。未提供时，模型提出的 PT 会标记为 `not_checked`，不代表已经通过 MedDRA 词表校验。
 
+Study A 内置了达格列净、恩格列净、卡格列净和艾托格列净的中文图表名称。未来研究其他药物时，可准备 UTF-8 JSON 映射文件：
+
+```json
+{
+  "semaglutide": "司美格鲁肽",
+  "tirzepatide": "替尔泊肽"
+}
+```
+
+并在命令中增加 `--drug-labels-zh drug_labels_zh.json`。模型返回的 `meddra_pt_zh` 是简体中文辅助释义，不能冒充授权中文 MedDRA 官方术语；英文 `meddra_pt` 仍是聚合、去重和可选 `pt.asc` 校验的主键。
+
+按 `Ctrl+C` 中断后，以完全相同的输入、药物列表、模型和输出目录重新运行，程序会跳过 checkpoint 中已完成的记录，只请求未完成项。若输入、提示词、药物列表或模型配置改变，程序会拒绝复用旧 checkpoint；请换新 `--output-dir`，或在明确希望丢弃旧模型结果时使用 `--restart`。
+
 ## 当前输出
 
 | 文件 | 说明 |
 |---|---|
 | `analysis_metadata.json` | 本次目标药物和纳入规则 |
+| `cleaning_summary.json` | 清洗前后数量、分原因删除数、用户数和 post/comment 数 |
 | `cleaned_posts.csv` | 清理和去重后的输入 |
-| `extractions.jsonl` | 本次运行逐条写入的模型结果；不是 checkpoint |
-| `post_extractions.csv` | 每条成功记录的暴露组列表 |
-| `exposure_records.csv` | 每条记录拆分后的 regimen 明细 |
-| `adverse_events.csv` | 各 regimen 下的不良反应明细 |
-| `exposure_group_summary.csv` | 各暴露组的记录数、暴露用户数和症状报告用户数 |
-| `pt_frequency_by_group.csv` | 各暴露组按独立用户去重的 PT 频数及两种分母百分比 |
-| `charts/single/*.png` | 各已观察单药组的前十症状图 |
-| `charts/combinations/*.png` | 各已观察联合用药组的前十症状图 |
+| `checkpoint_metadata.json` | 用于拒绝不兼容续跑的输入/提示词/模型指纹 |
+| `extractions.jsonl` | 按记录持久化的模型 checkpoint；已完成项续跑时跳过 |
+| `post_extractions_en.csv` / `_zh.csv` | 每条成功记录的暴露组列表，英文/中文版 |
+| `exposure_records_en.csv` / `_zh.csv` | 每条记录拆分后的 regimen 明细，英文/中文版 |
+| `adverse_events_en.csv` / `_zh.csv` | 各 regimen 下的不良反应明细，中文版同时保留英文 PT |
+| `exposure_group_summary_en.csv` / `_zh.csv` | 各暴露组的记录数、暴露用户数和症状报告用户数 |
+| `pt_frequency_by_group_en.csv` / `_zh.csv` | 各暴露组按独立用户去重的 PT 频数及两种分母百分比 |
+| `charts/en/<single|combinations>/*.png` | 英文版单药/联合用药前十症状图 |
+| `charts/zh/<single|combinations>/*.png` | 中文版单药/联合用药前十症状图 |
 
 `percent_of_exposed_users` 的分母是该暴露组全部用户，`percent_of_event_reporters` 的分母是该组中至少报告一项不良反应的用户。两者都不是药物不良反应的临床发生率。
 
@@ -228,13 +266,13 @@ python deepseek_pharmacovigilance.py `
 
 ## 给后续 Agent 的工作约定
 
-如果你是继续维护该项目的 Agent，请先完整阅读本 README、`PROJECT_REPORT_SOURCE.md` 和 `deepseek_pharmacovigilance.py`，再开始修改。凡是影响研究范围、数据状态、流程、统计口径或汇报叙事的改动，都必须同步更新 `PROJECT_REPORT_SOURCE.md` 的日期、状态和变更记录。
+如果你是继续维护该项目的 Agent，请先完整阅读本 README、`PROJECT_REPORT_SOURCE.md` 和 `pharmacovigilance_pipeline.py`，再开始修改。凡是影响研究范围、数据状态、流程、统计口径或汇报叙事的改动，都必须同步更新 `PROJECT_REPORT_SOURCE.md` 的日期、状态和变更记录。
 
 ### 修改原则
 
-1. 分析、统计和绘图逻辑主要位于 `deepseek_pharmacovigilance.py`；数据下载与前置召回逻辑位于 `download_reddit_data.py`。修改时保持两者输入输出约定一致。
+1. 分析、统计和绘图逻辑主要位于 `pharmacovigilance_pipeline.py`；数据下载与前置召回逻辑位于 `download_reddit_data.py`。修改时保持两者输入输出约定一致。
 2. 每次修改模型 JSON 结构时，必须同步修改系统提示词、`normalize_extraction()`、扁平化导出、统计函数、绘图函数和 README。
-3. 当前开发阶段不要重新引入 checkpoint、断点跳过或旧结果复用。每次运行必须从当前输入重新计算。
+3. 模型 checkpoint 必须同时校验输入指纹、提示词版本、药物列表和模型配置；只跳过兼容 checkpoint 中的已完成项。修改任一上述条件时应使用新输出目录，不得静默混用旧结果。
 4. 不要让模型返回判断证据或冗长解释；只返回后续统计必需的结构化字段。
 5. “提到药物”不等于“作者本人使用药物”。计划、假设、咨询、比较和他人用药不应进入暴露统计。
 6. 联合用药必须有同期使用语义；先停 A 再用 B 只能归入两个单药 regimen。
