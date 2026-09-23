@@ -2,7 +2,7 @@
 
 本仓库提供一条面向 Reddit 自报文本、可自定义目标药物、使用 DeepSeek 普通 API 的药物警戒分析管线。项目借鉴了论文《Self-Reported Side Effects of Semaglutide and Tirzepatide in Online Communities》的研究问题，但当前实现已经独立重写，不包含原论文的四阶段方法脚本。
 
-项目研究背景、当前状态、与原研究的差异、Study A 数据范围以及后续 HTML 汇报素材统一维护在 [`PROJECT_REPORT_SOURCE.md`](PROJECT_REPORT_SOURCE.md)。
+研究进度、统计核验与后续 HTML 汇报素材可维护在本机的 `PROJECT_REPORT_SOURCE.md`；该文件不随公开仓库分发。其他使用者应以自己下载的数据和运行结果建立记录，不应把 README 中的示例数字当作本机结果。
 
 本项目的结果用于发现 Reddit 用户关心的潜在不良反应信号，不能用于证明药物因果关系，也不能解读为临床发生率。
 
@@ -340,15 +340,15 @@ output/study_a_analysis/
 
 ## 给后续 Agent 的工作约定
 
-如果你是继续维护该项目的 Agent，请先完整阅读本 README、`PROJECT_REPORT_SOURCE.md`、`download_reddit_data.py` 和 `pharmacovigilance_pipeline.py`，再开始修改。凡是影响研究范围、数据状态、流程、统计口径或汇报叙事的改动，都必须同步更新 `PROJECT_REPORT_SOURCE.md` 的日期、状态和变更记录。
+如果你是继续维护该项目的 Agent，请先完整阅读本 README、`download_reddit_data.py` 和 `pharmacovigilance_pipeline.py`；若本机另有 `PROJECT_REPORT_SOURCE.md`，也应阅读并在研究范围、数据状态、流程或统计口径变化时更新。该报告和本地 `tests/` 文件不属于公开仓库，不要提交；克隆仓库后没有这些文件是正常情况。
 
 ### 从新研究到最终表图：Agent 逐步操作流程
 
-以下是**给 Agent 的交接顺序**，不是让用户一次执行所有命令。每完成一步，先核验文件与数量、向用户报告，再给出下一条命令。Study A 已完成；当前 Study B 已完成第 1–8 步，包括正式召回、评论下载、本地清洗与 100 条付费模型小样本，**尚未运行全量模型分析**。本次 100 条恰好未包含 Inclisiran，只能验证运行路径，不能证明第三种药的抽取效果；已核验数字见 `PROJECT_REPORT_SOURCE.md`。所有命令都从项目根目录运行；用户本机可在已有的 `pytorch` conda 环境中运行，但 README 不要求其他机器也有这个环境。
+以下是**给 Agent 的交接顺序**，不是让用户一次执行所有命令。每完成一步，先核验文件与数量、向用户报告，再给出下一条命令；不要从 README 推断当前机器已完成到哪一步。Study B 的 100 条按顺序抽样恰好未包含 Inclisiran，只能验证运行路径，不能证明第三种药的抽取效果。所有命令都从项目根目录运行；用户本机可在已有的 `pytorch` conda 环境中运行，但 README 不要求其他机器也有这个环境。
 
 1. **固定研究配置。** 与用户确认标准药物名、社区、UTC 半开时间窗、别名文件、数据目录和分析目录；不要把“研究包含三种药物”理解为“要求三药同时使用”。每项研究使用独立输出目录，避免 Study A 的召回 manifest、评论和模型 checkpoint 混入 Study B。Study B 使用 `evolocumab alirocumab inclisiran`、上述 5 个社区、`study_b_drug_aliases.json`、`data/reddit/study_b/` 和 `output/study_b_analysis/`。
 2. **先给 posts 下载计划，再下载。** 给用户本 README「Study B：下载近十年帖子」中的命令，先加 `--dry-run` 核对社区与年度切片；用户确认后去掉 `--dry-run`，保留 `--kinds posts` 开始下载。不要直接下载整个社区的 comments。长任务由用户在终端观察进度；不要在未经请求时替用户启动。按一次 `Ctrl+C` 后原命令续传。
-3. **核验 posts 并记录报告。** 检查每个预期 `.state.json` 的 `complete`、`count`，核对对应 JSONL 文件的实际行数和 post ID 去重情况，按社区汇总；不能仅凭终端显示 `finished` 宣称下载完整。将时间窗、社区、切片数和原始帖子数写入 `PROJECT_REPORT_SOURCE.md`，明确这些不是有效用药人数。
+3. **核验 posts 并记录报告。** 检查每个预期 `.state.json` 的 `complete`、`count`，核对对应 JSONL 文件的实际行数和 post ID 去重情况，按社区汇总；不能仅凭终端显示 `finished` 宣称下载完整。将时间窗、社区、切片数和原始帖子数写入本地研究记录（若有），明确这些不是有效用药人数；不要将该记录推送到公开仓库。
 4. **只读预览药名召回。** 使用上文 Study B 定向评论命令的 `--dry-run` 版本，必须包含 `--drug-alias-file study_b_drug_aliases.json`，且不要加 `--include-class-only`。向用户报告范围内 posts、候选 posts、按社区/药物分布、预计评论规模及模糊命中可能带来的误召回；此时既没有 manifest，也没有评论下载。Study B 已预览到 52,753 条原始帖中的 1,242 条候选帖，详见 report。
 5. **用户确认后正式召回并下载评论。** 给用户上文 Study B 的正式定向评论命令，起始并发建议 `--targeted-comment-workers 8`。该命令会先写 `recalled_posts.jsonl`、`recall_summary.json`，**随后立即开始**按 post ID 下载评论，不是“只生成名单”。中断后使用原命令续跑会复用 manifest。若日期、社区、别名或规则改变，先说明原 manifest 不再兼容，优先新建输出目录；不要在旧目录静默混用或随意加 `--refresh-recall`。
 6. **核验评论并更新报告。** 检查目标 post 数、完成/未完成线程、各 `.state.json` 的 `count` 与 JSONL 行数、唯一 comment ID 和 `link_id` 对应的 post ID；从正式 `recall_summary.json` 记录召回率及分组数。不要把帖子的 `num_comments` 合计当成实际下载的评论条数，也不要把药名提及当作本人用药。

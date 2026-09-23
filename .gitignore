@@ -10,6 +10,8 @@
 *.torrent
 data/reddit/
 output/
+PROJECT_REPORT_SOURCE.md
+tests/
 
 # Local copies of the original paper implementation
 01_data_collection.py
