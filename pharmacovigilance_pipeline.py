@@ -39,6 +39,8 @@ import argparse
 import asyncio
 import hashlib
 import hmac
+from collections import Counter
+from itertools import combinations
 import json
 import os
 import random
@@ -78,6 +80,44 @@ DEFAULT_DRUG_LABELS_ZH = {
     "canagliflozin": "卡格列净",
     "ertugliflozin": "艾托格列净",
 }
+OUTPUT_SUBDIRS = ("state", "cleaning", "records", "tables")
+LEGACY_OUTPUT_FILES = {
+    ".user_hash_salt": "state",
+    "analysis_metadata.json": "state",
+    "checkpoint_metadata.json": "state",
+    "extractions.jsonl": "state",
+    "cleaned_posts.csv": "cleaning",
+    "cleaning_summary.json": "cleaning",
+    "appendix_table_1_symptom_pairs_zh.csv": "tables",
+    "appendix_table_2_exclusive_single_drug_zh.csv": "tables",
+}
+for _stem, _folder in (
+    ("post_extractions", "records"),
+    ("exposure_records", "records"),
+    ("adverse_events", "records"),
+    ("exposure_group_summary", "tables"),
+    ("pt_frequency_by_group", "tables"),
+):
+    for _language in ("", "_en", "_zh"):
+        LEGACY_OUTPUT_FILES[f"{_stem}{_language}.csv"] = _folder
+
+
+def migrate_output_layout(output_dir: Path) -> None:
+    """Move known legacy outputs under their categories while holding the lock."""
+    for folder in OUTPUT_SUBDIRS:
+        (output_dir / folder).mkdir(exist_ok=True)
+    for name, folder in LEGACY_OUTPUT_FILES.items():
+        old_path = output_dir / name
+        if not old_path.exists():
+            continue
+        new_path = output_dir / folder / name
+        if new_path.exists():
+            raise RuntimeError(
+                f"Both legacy and organized output exist for {name}; "
+                "resolve the duplicate before running again"
+            )
+        old_path.replace(new_path)
+
 
 
 SYSTEM_PROMPT_TEMPLATE = """\
@@ -159,7 +199,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--input",
-        required=True,
         type=Path,
         help=(
             "CSV/JSONL input, or the targeted_comments directory containing "
@@ -207,6 +246,15 @@ def parse_args() -> argparse.Namespace:
         "--prepare-only",
         action="store_true",
         help="Clean and normalize the input without calling the model.",
+    )
+    parser.add_argument(
+        "--tables-only",
+        action="store_true",
+        help=(
+            "Build the two Chinese appendix-style tables from existing "
+            "exposure_records.csv and adverse_events.csv; do not clean input "
+            "or call the model."
+        ),
     )
     parser.add_argument(
         "--restart",
@@ -288,6 +336,7 @@ def build_system_prompt(target_drugs: list[str]) -> str:
 
 
 def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     with temporary.open("w", encoding="utf-8") as stream:
         json.dump(payload, stream, ensure_ascii=False, indent=2)
@@ -301,12 +350,13 @@ def load_or_create_user_hash_salt(output_dir: Path) -> bytes:
     configured = os.getenv("user_hash_salt") or os.getenv("USER_HASH_SALT")
     if configured:
         return configured.encode("utf-8")
-    path = output_dir / ".user_hash_salt"
+    path = output_dir / "state" / ".user_hash_salt"
     if path.exists():
         value = path.read_text(encoding="utf-8").strip()
         if not value:
             raise RuntimeError(f"Empty user hash salt file: {path}")
         return value.encode("utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)
     value = secrets.token_hex(32)
     path.write_text(value + "\n", encoding="utf-8")
     return value.encode("utf-8")
@@ -798,6 +848,7 @@ def dataframe_fingerprint(posts: pd.DataFrame) -> str:
 
 
 def write_csv_atomic(data: pd.DataFrame, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     data.to_csv(temporary, index=False)
     os.replace(temporary, path)
@@ -1275,6 +1326,153 @@ def build_group_tables(
     return summary[summary_columns], frequency[frequency_columns]
 
 
+def build_appendix_tables(
+    exposure_df: pd.DataFrame,
+    event_df: pd.DataFrame,
+    target_drugs: list[str],
+    drug_labels_zh: dict[str, str],
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Chinese symptom-label analogues of the source paper's Tables 1 and 2."""
+    pair_columns = [
+        "共现症状1", "共现症状2", "报告用户数",
+        "占目标药物暴露用户比例（%）",
+    ]
+    denominators: dict[str, int] = {}
+    user_groups = exposure_df.groupby("user_id")["exposure_group"].agg(
+        lambda values: set(values)
+    )
+    exclusive_drug_by_user = {
+        user_id: next(iter(groups))
+        for user_id, groups in user_groups.items()
+        if len(groups) == 1 and next(iter(groups)) in target_drugs
+    }
+    for drug in target_drugs:
+        denominators[drug] = sum(
+            observed == drug for observed in exclusive_drug_by_user.values()
+        )
+    frequency_columns = ["症状中文辅助释义"]
+    for drug in target_drugs:
+        label = drug_labels_zh.get(drug, drug)
+        frequency_columns.extend(
+            [f"{label}（n={denominators[drug]}）：人数", f"{label}：比例（%）"]
+        )
+
+    if event_df.empty:
+        return (
+            pd.DataFrame(columns=pair_columns),
+            pd.DataFrame(columns=frequency_columns),
+        )
+
+    events = event_df.copy()
+    events["analysis_term"] = events["validated_meddra_pt"].where(
+        events["validated_meddra_pt"].ne(""),
+        events["proposed_meddra_pt"],
+    )
+    events = events[events["analysis_term"].ne("")].copy()
+    term_labels = events.groupby("analysis_term")["meddra_pt_zh"].agg(
+        lambda values: (
+            values[values.ne("")].value_counts().index[0]
+            if values.ne("").any() else ""
+        )
+    ).to_dict()
+    events["symptom_zh"] = events["analysis_term"].map(
+        lambda term: term_labels[term] or term
+    )
+    events["symptom_zh"] = events["symptom_zh"].map(normalize_whitespace)
+    events = events[events["symptom_zh"].ne("")].copy()
+    events = events[events["user_id"].isin(user_groups.index)]
+    if events.empty:
+        return (
+            pd.DataFrame(columns=pair_columns),
+            pd.DataFrame(columns=frequency_columns),
+        )
+
+    user_terms = (
+        events.drop_duplicates(["user_id", "symptom_zh"])
+        .groupby("user_id")["symptom_zh"]
+        .agg(lambda values: sorted(set(values)))
+    )
+    pair_counts: Counter[tuple[str, str]] = Counter()
+    for terms in user_terms:
+        pair_counts.update(combinations(terms, 2))
+    total_exposed_users = int(exposure_df["user_id"].nunique())
+    pair_rows = [
+        {
+            "共现症状1": first,
+            "共现症状2": second,
+            "报告用户数": count,
+            "占目标药物暴露用户比例（%）": round(
+                100 * count / total_exposed_users, 1
+            ),
+        }
+        for (first, second), count in pair_counts.items()
+        if total_exposed_users and 100 * count / total_exposed_users >= 0.5
+    ]
+    pair_rows.sort(
+        key=lambda row: (-row["报告用户数"], row["共现症状1"], row["共现症状2"])
+    )
+
+    exclusive_events = events[
+        events["user_id"].isin(exclusive_drug_by_user)
+    ].drop_duplicates(["user_id", "symptom_zh"])
+    exclusive_events = exclusive_events.assign(
+        exclusive_drug=exclusive_events["user_id"].map(exclusive_drug_by_user)
+    )
+    drug_term_counts = (
+        exclusive_events.groupby(["exclusive_drug", "symptom_zh"])
+        .size()
+        .to_dict()
+    )
+    frequency_rows = []
+    for term in sorted(exclusive_events["symptom_zh"].unique()):
+        counts = [drug_term_counts.get((drug, term), 0) for drug in target_drugs]
+        if not any(
+            denominators[drug]
+            and 100 * count / denominators[drug] >= 0.5
+            for drug, count in zip(target_drugs, counts)
+        ):
+            continue
+        row: dict[str, Any] = {"症状中文辅助释义": term}
+        for drug, count in zip(target_drugs, counts):
+            label = drug_labels_zh.get(drug, drug)
+            row[f"{label}（n={denominators[drug]}）：人数"] = count
+            row[f"{label}：比例（%）"] = (
+                round(100 * count / denominators[drug], 2)
+                if denominators[drug] else 0.0
+            )
+        frequency_rows.append((sum(counts), row))
+    frequency_rows.sort(
+        key=lambda item: (-item[0], item[1]["症状中文辅助释义"])
+    )
+    return (
+        pd.DataFrame(pair_rows, columns=pair_columns),
+        pd.DataFrame([row for _, row in frequency_rows], columns=frequency_columns),
+    )
+
+
+def write_appendix_tables(
+    exposure_df: pd.DataFrame,
+    event_df: pd.DataFrame,
+    output_dir: Path,
+    target_drugs: list[str],
+    drug_labels_zh: dict[str, str],
+) -> None:
+    pairs, single_drug_frequency = build_appendix_tables(
+        exposure_df, event_df, target_drugs, drug_labels_zh
+    )
+    write_csv_atomic(
+        pairs, output_dir / "tables" / "appendix_table_1_symptom_pairs_zh.csv"
+    )
+    write_csv_atomic(
+        single_drug_frequency,
+        output_dir / "tables" / "appendix_table_2_exclusive_single_drug_zh.csv",
+    )
+    print(
+        f"Chinese appendix tables: {len(pairs):,} symptom pairs; "
+        f"{len(single_drug_frequency):,} single-drug symptom rows"
+    )
+
+
 def save_top_symptom_chart(
     pt_frequency: pd.DataFrame,
     output_path: Path,
@@ -1517,14 +1715,62 @@ def write_bilingual_csv(
     )
 
 
+def run_tables_only(
+    output_dir: Path,
+    target_drugs: list[str],
+    drug_labels_zh: dict[str, str],
+) -> None:
+    metadata_path = output_dir / "state" / "analysis_metadata.json"
+    if not metadata_path.exists():
+        raise FileNotFoundError(metadata_path)
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    if metadata.get("target_drugs") != target_drugs:
+        raise ValueError("--target-drugs differs from this output directory")
+    if metadata.get("drug_labels_zh") != drug_labels_zh:
+        raise ValueError(
+            "Chinese drug labels differ from this output directory; "
+            "pass the same --drug-labels-zh file as the original run"
+        )
+    exposure_path = output_dir / "records" / "exposure_records.csv"
+    event_path = output_dir / "records" / "adverse_events.csv"
+    for path in (exposure_path, event_path):
+        if not path.exists():
+            raise FileNotFoundError(path)
+    results_path = output_dir / "state" / "extractions.jsonl"
+    if results_path.exists() and any(
+        path.stat().st_mtime_ns < results_path.stat().st_mtime_ns
+        for path in (exposure_path, event_path)
+    ):
+        raise RuntimeError(
+            "Model checkpoint is newer than the exported records. Run the "
+            "normal pipeline first to refresh exposure/adverse-event CSVs."
+        )
+    exposure_df = pd.read_csv(
+        exposure_path, dtype=str, keep_default_na=False
+    )
+    event_df = pd.read_csv(event_path, dtype=str, keep_default_na=False)
+    required_exposure = {"user_id", "exposure_group"}
+    required_event = {
+        "user_id", "proposed_meddra_pt", "validated_meddra_pt",
+        "meddra_pt_zh",
+    }
+    if not required_exposure.issubset(exposure_df.columns):
+        raise ValueError("exposure_records.csv is missing required columns")
+    if not required_event.issubset(event_df.columns):
+        raise ValueError("adverse_events.csv is missing required columns")
+    write_appendix_tables(
+        exposure_df, event_df, output_dir, target_drugs, drug_labels_zh
+    )
+
+
 def run_pipeline_locked(
     args: argparse.Namespace,
     target_drugs: list[str],
     drug_labels_zh: dict[str, str],
     output_dir: Path,
 ) -> None:
-    results_path = output_dir / "extractions.jsonl"
-    checkpoint_metadata_path = output_dir / "checkpoint_metadata.json"
+    results_path = output_dir / "state" / "extractions.jsonl"
+    checkpoint_metadata_path = output_dir / "state" / "checkpoint_metadata.json"
     if args.restart:
         results_path.unlink(missing_ok=True)
         checkpoint_metadata_path.unlink(missing_ok=True)
@@ -1535,7 +1781,7 @@ def run_pipeline_locked(
     cleaned_before_limit = len(cleaned)
     if args.limit is not None:
         cleaned = cleaned.head(args.limit).copy()
-    write_csv_atomic(cleaned, output_dir / "cleaned_posts.csv")
+    write_csv_atomic(cleaned, output_dir / "cleaning" / "cleaned_posts.csv")
 
     source_counts = (
         cleaned.get("source_type", pd.Series(dtype=str))
@@ -1559,7 +1805,9 @@ def run_pipeline_locked(
         },
         "user_ids": "HMAC-SHA256 pseudonyms; raw author names are omitted",
     }
-    atomic_write_json(output_dir / "cleaning_summary.json", cleaning_summary)
+    atomic_write_json(
+        output_dir / "cleaning" / "cleaning_summary.json", cleaning_summary
+    )
     print(
         f"Cleaning complete: {len(raw):,} raw rows -> "
         f"{len(cleaned):,} cleaned rows; "
@@ -1581,7 +1829,9 @@ def run_pipeline_locked(
         "checkpoint_enabled": True,
         "concurrent_write_strategy": "workers -> queue -> single durable writer",
     }
-    atomic_write_json(output_dir / "analysis_metadata.json", analysis_metadata)
+    atomic_write_json(
+        output_dir / "state" / "analysis_metadata.json", analysis_metadata
+    )
     if args.prepare_only:
         print(f"Prepare-only mode: outputs written to {output_dir}")
         return
@@ -1641,25 +1891,28 @@ def run_pipeline_locked(
         target_drugs=target_drugs,
     )
     write_bilingual_csv(
-        post_df, output_dir / "post_extractions.csv", drug_labels_zh
+        post_df, output_dir / "records" / "post_extractions.csv", drug_labels_zh
     )
     write_bilingual_csv(
-        exposure_df, output_dir / "exposure_records.csv", drug_labels_zh
+        exposure_df, output_dir / "records" / "exposure_records.csv", drug_labels_zh
     )
     write_bilingual_csv(
-        event_df, output_dir / "adverse_events.csv", drug_labels_zh
+        event_df, output_dir / "records" / "adverse_events.csv", drug_labels_zh
     )
 
     group_summary, pt_frequency = build_group_tables(exposure_df, event_df)
     write_bilingual_csv(
         group_summary,
-        output_dir / "exposure_group_summary.csv",
+        output_dir / "tables" / "exposure_group_summary.csv",
         drug_labels_zh,
     )
     write_bilingual_csv(
         pt_frequency,
-        output_dir / "pt_frequency_by_group.csv",
+        output_dir / "tables" / "pt_frequency_by_group.csv",
         drug_labels_zh,
+    )
+    write_appendix_tables(
+        exposure_df, event_df, output_dir, target_drugs, drug_labels_zh
     )
     chart_count = save_group_charts(
         group_summary,
@@ -1679,6 +1932,13 @@ def run_pipeline_locked(
 
 def main() -> None:
     args = parse_args()
+    if args.tables_only and (args.prepare_only or args.restart or args.limit):
+        raise ValueError(
+            "--tables-only cannot be combined with --prepare-only, "
+            "--restart, or --limit"
+        )
+    if not args.tables_only and args.input is None:
+        raise ValueError("--input is required unless --tables-only is used")
     if args.concurrency < 1:
         raise ValueError("--concurrency must be at least 1")
     if args.limit is not None and args.limit < 1:
@@ -1693,7 +1953,11 @@ def main() -> None:
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     with output_directory_lock(output_dir):
-        run_pipeline_locked(args, target_drugs, drug_labels_zh, output_dir)
+        migrate_output_layout(output_dir)
+        if args.tables_only:
+            run_tables_only(output_dir, target_drugs, drug_labels_zh)
+        else:
+            run_pipeline_locked(args, target_drugs, drug_labels_zh, output_dir)
 
 
 if __name__ == "__main__":

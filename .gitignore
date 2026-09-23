@@ -3,6 +3,7 @@
 *.xlsx
 *.jsonl
 *.json
+!study_b_drug_aliases.json
 *.zst
 *.zst_blocks
 *.parquet

@@ -82,6 +82,8 @@ FUZZY_SIMILARITY_THRESHOLD = 0.80
 FUZZY_MIN_ALIAS_LENGTH = 7
 DEFAULT_TARGETED_COMMENT_WORKERS = 8
 MAX_TARGETED_COMMENT_WORKERS = 32
+DEFAULT_COMMUNITY_WORKERS = 5
+MAX_COMMUNITY_WORKERS = 16
 WORD_PATTERN = re.compile(r"[a-z]+", re.IGNORECASE)
 FIELDS = {
     "posts": [
@@ -180,6 +182,16 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.8,
         help="Minimum delay between successful requests in seconds.",
+    )
+    parser.add_argument(
+        "--community-workers",
+        type=int,
+        default=DEFAULT_COMMUNITY_WORKERS,
+        help=(
+            "Parallel communities for raw downloads, from 1 to "
+            f"{MAX_COMMUNITY_WORKERS} (default: {DEFAULT_COMMUNITY_WORKERS}). "
+            "Yearly slices within each community remain sequential."
+        ),
     )
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument(
@@ -531,6 +543,8 @@ def request_page(
     job: DownloadJob,
     cursor: int,
     args: argparse.Namespace,
+    stop_event: Event | None = None,
+    wait_callback: Any = None,
 ) -> list[dict[str, Any]]:
     endpoint = f"{API_BASE}/{job.kind}/search"
     params = {
@@ -541,7 +555,10 @@ def request_page(
         "limit": args.page_size,
         "fields": ",".join(FIELDS[job.kind]),
     }
-    return request_items(endpoint, params, args)
+    return request_items(
+        endpoint, params, args,
+        stop_event=stop_event, wait_callback=wait_callback,
+    )
 
 
 def created_epoch(item: dict[str, Any]) -> int | None:
@@ -551,21 +568,38 @@ def created_epoch(item: dict[str, Any]) -> int | None:
         return None
 
 
-def load_recent_ids(path: Path, limit: int) -> set[str]:
-    """Read only a rolling tail of IDs to make page-level resume idempotent."""
+def inspect_raw_output(path: Path, limit: int) -> tuple[set[str], int]:
+    """Repair a torn final line and reconcile records after an interrupted write."""
     recent: deque[str] = deque(maxlen=limit)
     if not path.exists() or path.stat().st_size == 0:
-        return set()
-    with path.open("r", encoding="utf-8") as stream:
-        for line in stream:
+        return set(), 0
+    count = 0
+    with path.open("r+b") as stream:
+        while True:
+            line_start = stream.tell()
+            line = stream.readline()
+            if not line:
+                break
             try:
                 item = json.loads(line)
-            except json.JSONDecodeError:
-                continue
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                if line.endswith(b"\n"):
+                    raise RuntimeError(
+                        f"Invalid JSONL record in {path} at byte {line_start}"
+                    ) from exc
+                stream.truncate(line_start)
+                stream.flush()
+                os.fsync(stream.fileno())
+                break
+            if not line.endswith(b"\n"):
+                stream.write(b"\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            count += 1
             item_id = str(item.get("id", "")).strip()
             if item_id:
                 recent.append(item_id)
-    return set(recent)
+    return set(recent), count
 
 
 def load_all_ids(path: Path) -> set[str]:
@@ -622,27 +656,105 @@ def print_progress(
     )
 
 
-def download_job(job: DownloadJob, args: argparse.Namespace) -> None:
+class RawDownloadProgress:
+    """Render one shared progress line instead of interleaved worker output."""
+
+    def __init__(self, total: int, workers: int) -> None:
+        self.total = total
+        self.workers = workers
+        self.completed = 0
+        self.pages = 0
+        self.new_records = 0
+        self.started_at = time.monotonic()
+        self.lock = Lock()
+
+    def _render(self, detail: str) -> None:
+        elapsed = max(time.monotonic() - self.started_at, 0.001)
+        message = (
+            f"Jobs {self.completed}/{self.total} | workers {self.workers} | "
+            f"new records {self.new_records:,} | pages {self.pages:,} | "
+            f"{self.new_records / elapsed:.1f} rec/s | {detail}"
+        )
+        print(message[:170].ljust(170), end="\r", flush=True)
+
+    def page(self, job: DownloadJob, state: dict[str, Any], added: int) -> None:
+        with self.lock:
+            self.pages += 1
+            self.new_records += added
+            self._render(
+                f"r/{job.subreddit} {job.kind} "
+                f"{date_label(job.start_epoch)} "
+                f"{format_epoch(min(int(state['cursor']), job.end_epoch))}"
+            )
+
+    def done(self, job: DownloadJob, skipped: bool = False) -> None:
+        with self.lock:
+            self.completed += 1
+            status = "already complete" if skipped else "saved"
+            self._render(
+                f"{status}: r/{job.subreddit} {job.kind} "
+                f"{date_label(job.start_epoch)}"
+            )
+
+    def retry(self, job: DownloadJob, reason: str, remaining: float) -> None:
+        with self.lock:
+            self._render(
+                f"retry r/{job.subreddit} {job.kind}: "
+                f"{reason} ({remaining:.0f}s)"
+            )
+
+    def finish(self) -> None:
+        with self.lock:
+            self._render("stopped" if self.completed < self.total else "finished")
+            print()
+
+
+def download_job(
+    job: DownloadJob,
+    args: argparse.Namespace,
+    progress: RawDownloadProgress | None = None,
+    stop_event: Event | None = None,
+) -> None:
+    if stop_event is not None and stop_event.is_set():
+        return
     state = load_state(job)
     if state.get("complete") and job.output_path.exists():
-        print(
-            f"[{job.index:03d}/{job.total:03d}] SKIP complete: "
-            f"r/{job.subreddit} {job.kind} "
-            f"{date_label(job.start_epoch)}..{date_label(job.end_epoch)}"
-        )
+        if progress is not None:
+            progress.done(job, skipped=True)
+        else:
+            print(
+                f"[{job.index:03d}/{job.total:03d}] SKIP complete: "
+                f"r/{job.subreddit} {job.kind} "
+                f"{date_label(job.start_epoch)}..{date_label(job.end_epoch)}"
+            )
         return
 
     job.output_path.parent.mkdir(parents=True, exist_ok=True)
     job.output_path.touch(exist_ok=True)
     started_at = time.monotonic()
+    recent_ids, stored_count = inspect_raw_output(
+        job.output_path, args.page_size * 2
+    )
+    if int(state.get("count", 0)) != stored_count:
+        state["count"] = stored_count
+        save_state(job, state)
     initial_count = int(state.get("count", 0))
-    recent_ids = load_recent_ids(job.output_path, args.page_size * 2)
     cursor = max(int(state.get("cursor", job.start_epoch)), job.start_epoch)
     state.update(complete=False, cursor=cursor)
-    print_progress(job, state, started_at, initial_count)
+    if progress is None:
+        print_progress(job, state, started_at, initial_count)
 
     while cursor < job.end_epoch:
-        items = request_page(job, cursor, args)
+        if stop_event is not None and stop_event.is_set():
+            return
+        wait_callback = (
+            (lambda reason, remaining: progress.retry(job, reason, remaining))
+            if progress is not None else None
+        )
+        items = request_page(
+            job, cursor, args,
+            stop_event=stop_event, wait_callback=wait_callback,
+        )
         valid = []
         page_epochs = []
         for item in items:
@@ -687,11 +799,21 @@ def download_job(job: DownloadJob, args: argparse.Namespace) -> None:
         state["pages"] = int(state.get("pages", 0)) + 1
         state["complete"] = cursor >= job.end_epoch
         save_state(job, state)
-        print_progress(job, state, started_at, initial_count)
+        if progress is not None:
+            progress.page(job, state, len(valid))
+        else:
+            print_progress(job, state, started_at, initial_count)
         if cursor < job.end_epoch and args.request_delay:
-            time.sleep(args.request_delay)
+            if stop_event is not None:
+                if stop_event.wait(args.request_delay):
+                    return
+            else:
+                time.sleep(args.request_delay)
 
-    print()
+    if progress is not None:
+        progress.done(job)
+    else:
+        print()
 
 
 def print_plan(jobs: list[DownloadJob]) -> None:
@@ -703,6 +825,60 @@ def print_plan(jobs: list[DownloadJob]) -> None:
             f"{date_label(job.start_epoch)}..{date_label(job.end_epoch)} "
             f"-> {job.output_path}"
         )
+
+
+def download_raw_jobs_parallel(
+    jobs: list[DownloadJob], args: argparse.Namespace
+) -> None:
+    """Give each community one worker and one sequential stream of slices."""
+    grouped: dict[str, list[DownloadJob]] = {}
+    for job in jobs:
+        grouped.setdefault(job.subreddit.casefold(), []).append(job)
+    workers = min(args.community_workers, len(grouped))
+    progress = RawDownloadProgress(len(jobs), workers)
+    stop_event = Event()
+
+    def run_community(community_jobs: list[DownloadJob]) -> None:
+        for job in community_jobs:
+            if stop_event.is_set():
+                return
+            download_job(job, args, progress, stop_event)
+
+    executor = ThreadPoolExecutor(
+        max_workers=workers, thread_name_prefix="reddit-community"
+    )
+    futures = [
+        executor.submit(run_community, community_jobs)
+        for community_jobs in grouped.values()
+    ]
+    failures: list[BaseException] = []
+    try:
+        for future in as_completed(futures):
+            try:
+                future.result()
+            except InterruptedError:
+                if not stop_event.is_set():
+                    raise
+            except Exception as exc:
+                failures.append(exc)
+                stop_event.set()
+                for pending in futures:
+                    pending.cancel()
+    except KeyboardInterrupt:
+        stop_event.set()
+        for future in futures:
+            future.cancel()
+        executor.shutdown(wait=True, cancel_futures=True)
+        progress.finish()
+        raise
+    else:
+        executor.shutdown(wait=True, cancel_futures=True)
+        progress.finish()
+    if failures:
+        raise RuntimeError(
+            f"{len(failures)} community worker(s) failed; completed pages "
+            f"remain resumable. First error: {failures[0]}"
+        ) from failures[0]
 
 
 def load_drug_aliases(path: Path | None) -> dict[str, list[str]]:
@@ -1349,10 +1525,10 @@ def targeted_output_path(output_dir: Path, post: RecalledPost) -> Path:
 
 
 @contextmanager
-def targeted_output_lock(output_dir: Path):
+def output_directory_lock(output_dir: Path, filename: str, label: str):
     """Prevent two downloader processes from writing one output directory."""
     output_dir.mkdir(parents=True, exist_ok=True)
-    lock_path = output_dir / ".comment_download.lock"
+    lock_path = output_dir / filename
     stream = lock_path.open("a+b")
     stream.seek(0, os.SEEK_END)
     if stream.tell() == 0:
@@ -1371,7 +1547,7 @@ def targeted_output_lock(output_dir: Path):
     except (OSError, BlockingIOError) as exc:
         stream.close()
         raise RuntimeError(
-            "Another targeted-comment downloader is already using "
+            f"Another {label} downloader is already using "
             f"this output directory: {output_dir}"
         ) from exc
     try:
@@ -1387,6 +1563,12 @@ def targeted_output_lock(output_dir: Path):
 
             fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
         stream.close()
+
+
+def targeted_output_lock(output_dir: Path):
+    return output_directory_lock(
+        output_dir, ".comment_download.lock", "targeted-comment"
+    )
 
 
 def load_targeted_state(
@@ -1819,6 +2001,11 @@ def main() -> None:
         raise ValueError("--max-retries cannot be negative")
     if args.max_recalled_posts is not None and args.max_recalled_posts < 1:
         raise ValueError("--max-recalled-posts must be at least 1")
+    if not 1 <= args.community_workers <= MAX_COMMUNITY_WORKERS:
+        raise ValueError(
+            "--community-workers must be between 1 and "
+            f"{MAX_COMMUNITY_WORKERS}"
+        )
     if not 1 <= args.targeted_comment_workers <= MAX_TARGETED_COMMENT_WORKERS:
         raise ValueError(
             "--targeted-comment-workers must be between 1 and "
@@ -1834,12 +2021,16 @@ def main() -> None:
         return
 
     print(
-        f"Starting {len(jobs)} jobs. Press Ctrl+C to stop safely; "
+        f"Starting {len(jobs)} jobs across "
+        f"{min(args.community_workers, len(normalize_subreddits(args.subreddits)))} "
+        "community workers. Press Ctrl+C to stop safely; "
         "run the same command to resume."
     )
     try:
-        for job in jobs:
-            download_job(job, args)
+        with output_directory_lock(
+            args.output_dir.resolve(), ".raw_download.lock", "raw-data"
+        ):
+            download_raw_jobs_parallel(jobs, args)
     except KeyboardInterrupt:
         print("\nStopped by user. Completed pages are saved; rerun to resume.")
         raise SystemExit(130)

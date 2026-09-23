@@ -25,7 +25,8 @@
 - 可选地将模型提出的 MedDRA PT 与本地授权词表 `pt.asc` 做精确匹配。
 - 输出按“用户 + 暴露组 + PT”去重的频数，并为各单药组和联合用药组分别绘制前十症状图。
 - 表格和图表同时输出中文、英文版；英文 MedDRA PT 作为统计主键，中文是帮助理解的辅助释义。
-- `extractions.jsonl` 是可续跑 checkpoint；只跳过已完成记录，失败或中断记录会在下次重试。
+- 另输出仿照原文附录表 1、表 2 的两张中文症状统计 CSV：用户级症状两两共现，以及全程仅识别到一种目标药物的单药对照。
+- `state/extractions.jsonl` 是可续跑 checkpoint；只跳过已完成记录，失败或中断记录会在下次重试。
 - 用输入指纹、提示词版本、药物列表和模型配置校验 checkpoint，防止误用过期结果。
 - 并发 worker 通过队列交结果，由单一写入器逐条 `flush + fsync`；输出目录跨进程锁阻止两个任务共用同一 checkpoint。
 
@@ -99,6 +100,52 @@ python download_reddit_data.py
 ```
 
 可在任意时候按 `Ctrl+C` 中断。以相同参数重新执行时，已完成的切片会跳过，未完成切片从同目录的 `.state.json` 记录继续。输出默认写入 `data/reddit/raw/<subreddit>/<posts|comments>/`，该目录已被 Git 忽略。
+
+原始数据下载现在按社区并行、按同一社区的年度切片顺序下载。`--community-workers` 控制同时下载的社区数（1–16，默认 5）；每个年度切片独占自己的 JSONL 和 `.state.json`。同一输出目录有跨进程排他锁，避免重复启动造成文件冲突。终端进度显示已完成任务数、本次新增记录数与页数。增加并发可能触发 Arctic Shift 限流，遇到临时网络错误会按原有退避机制重试。
+
+#### Study B：下载近十年帖子
+
+Study B 首轮社区为 `Cholesterol`、`repatha`、`HeartAttack`、`HeartDisease`、`PeterAttia`。下面的结束日期是 UTC 独占边界，覆盖 `[2016-09-23, 2026-09-23)`；**只下载 posts，不下载全社区 comments**。后续从候选帖子按 ID 定向下载评论。
+
+```powershell
+python download_reddit_data.py `
+  --output-dir data/reddit/study_b/raw_10years `
+  --subreddits Cholesterol repatha HeartAttack HeartDisease PeterAttia `
+  --kinds posts `
+  --start-date 2016-09-23 `
+  --end-date 2026-09-23 `
+  --community-workers 5
+```
+
+需要中断时按一次 `Ctrl+C`，之后运行**完全相同的命令**即可续传；不要同时启动第二份相同输出目录的下载任务。要先检查切片计划，可在命令末尾加 `--dry-run`。Study B 后续召回时必须传 `--drug-alias-file study_b_drug_aliases.json`，否则会误用默认的 Study A 药物别名表；该文件列出了三种通用名及 Repatha、Praluent、Leqvio 商品名，长名称还会使用现有的模糊拼写匹配。
+
+Study B 下载完 posts 后，先只在本地预览将下载哪些帖子对应的评论线程；`--dry-run` 不写入 manifest，也不发起评论 API 请求：
+
+```powershell
+python download_reddit_data.py `
+  --targeted-comments-from-posts data/reddit/study_b/raw_10years `
+  --output-dir data/reddit/study_b/targeted_comments `
+  --subreddits Cholesterol repatha HeartAttack HeartDisease PeterAttia `
+  --start-date 2016-09-23 `
+  --end-date 2026-09-23 `
+  --drug-alias-file study_b_drug_aliases.json `
+  --dry-run
+```
+
+确认召回规模后，使用正式命令保存 `recalled_posts.jsonl`、`recall_summary.json`，然后按候选 post ID 并行下载评论：
+
+```powershell
+python download_reddit_data.py `
+  --targeted-comments-from-posts data/reddit/study_b/raw_10years `
+  --output-dir data/reddit/study_b/targeted_comments `
+  --subreddits Cholesterol repatha HeartAttack HeartDisease PeterAttia `
+  --start-date 2016-09-23 `
+  --end-date 2026-09-23 `
+  --drug-alias-file study_b_drug_aliases.json `
+  --targeted-comment-workers 8
+```
+
+中断后原命令续传会复用已保存的召回 manifest，不会再次扫描全部 posts。Study B 不使用 `--include-class-only`；仅提到 PCSK9 类别而没有具体目标药物名称的帖子暂不召回。
 
 自定义社区或时间范围的示例：
 
@@ -188,12 +235,12 @@ dry run 和正式运行在扫描本地 posts 时都会显示实时进度条，�
 ```powershell
 python pharmacovigilance_pipeline.py `
   --input data/reddit/targeted_comments `
-  --output-dir output/study_a `
+  --output-dir output/study_a_analysis `
   --target-drugs dapagliflozin empagliflozin canagliflozin ertugliflozin `
   --prepare-only
 ```
 
-该命令生成 `cleaned_posts.csv` 和 `cleaning_summary.json`。首次运行还会在输出目录创建本地 `.user_hash_salt`；同一输出目录后续运行会复用它，以保持用户伪名稳定。不要公开该盐值文件。
+该命令生成 `cleaning/cleaned_posts.csv` 和 `cleaning/cleaning_summary.json`。首次运行还会在 `state/` 创建本地 `.user_hash_salt`；同一输出目录后续运行会复用它，以保持用户伪名稳定。不要公开该盐值文件。
 
 再用独立输出目录做小样本模型测试：
 
@@ -212,7 +259,7 @@ python pharmacovigilance_pipeline.py `
 ```powershell
 python pharmacovigilance_pipeline.py `
   --input data/reddit/targeted_comments `
-  --output-dir output/study_a `
+  --output-dir output/study_a_analysis `
   --target-drugs dapagliflozin empagliflozin canagliflozin ertugliflozin `
   --meddra-pt MedDRA_28_0_English/MedAscii/pt.asc `
   --concurrency 150 `
@@ -234,24 +281,51 @@ Study A 内置了达格列净、恩格列净、卡格列净和艾托格列净的
 
 按 `Ctrl+C` 中断后，以完全相同的输入、药物列表、模型和输出目录重新运行，程序会跳过 checkpoint 中已完成的记录，只请求未完成项。若输入、提示词、药物列表或模型配置改变，程序会拒绝复用旧 checkpoint；请换新 `--output-dir`，或在明确希望丢弃旧模型结果时使用 `--restart`。
 
+普通续跑**仍会重新读取原始 post/comment、执行清洗并覆盖 `cleaning/cleaned_posts.csv`**；模型 checkpoint 只节省已完成记录的 API 请求。若只是根据已导出的暴露和症状明细生成附录风格统计表，使用下述命令。它不需要 `--input`、`.env` 或 API 余额，也不会重新清洗或改写 `state/extractions.jsonl`：
+
+```powershell
+python pharmacovigilance_pipeline.py `
+  --tables-only `
+  --output-dir output/study_a_analysis `
+  --target-drugs dapagliflozin empagliflozin canagliflozin ertugliflozin
+```
+
+`--tables-only` 会确认药物列表与该输出目录的 `state/analysis_metadata.json` 一致，并检查 `records/` 中的暴露/事件 CSV 没有早于模型 checkpoint。若模型结果刚刚续跑而导出表尚未更新，应先按普通管线命令完成导出。
+
 ## 当前输出
 
-| 文件 | 说明 |
+每个分析批次在 `--output-dir` 下按用途分层；已有旧版平铺输出会在下次运行时自动迁移，迁移时不重新抽取或修改文件内容。根目录仅保留跨进程锁 `.analysis.lock` 和下面的子目录：
+
+```text
+output/study_a_analysis/
+├── state/       模型 checkpoint、运行配置、用户哈希盐
+├── cleaning/    清洗后的模型输入及清洗汇总
+├── records/     逐记录的模型判断、暴露和症状明细
+├── tables/      汇总统计和附录风格中文表
+└── charts/      中英双语单药/联合用药柱状图
+```
+
+| 文件（相对 `--output-dir`） | 说明 |
 |---|---|
-| `analysis_metadata.json` | 本次目标药物和纳入规则 |
-| `cleaning_summary.json` | 清洗前后数量、分原因删除数、用户数和 post/comment 数 |
-| `cleaned_posts.csv` | 清理和去重后的输入 |
-| `checkpoint_metadata.json` | 用于拒绝不兼容续跑的输入/提示词/模型指纹 |
-| `extractions.jsonl` | 按记录持久化的模型 checkpoint；已完成项续跑时跳过 |
-| `post_extractions_en.csv` / `_zh.csv` | 每条成功记录的暴露组列表，英文/中文版 |
-| `exposure_records_en.csv` / `_zh.csv` | 每条记录拆分后的 regimen 明细，英文/中文版 |
-| `adverse_events_en.csv` / `_zh.csv` | 各 regimen 下的不良反应明细，中文版同时保留英文 PT |
-| `exposure_group_summary_en.csv` / `_zh.csv` | 各暴露组的记录数、暴露用户数和症状报告用户数 |
-| `pt_frequency_by_group_en.csv` / `_zh.csv` | 各暴露组按独立用户去重的 PT 频数及两种分母百分比 |
+| `state/analysis_metadata.json` | 本次目标药物和纳入规则 |
+| `state/checkpoint_metadata.json` | 用于拒绝不兼容续跑的输入/提示词/模型指纹 |
+| `state/extractions.jsonl` | 按记录持久化的模型 checkpoint；已完成项续跑时跳过 |
+| `state/.user_hash_salt` | 稳定生成去标识化用户 ID 的私密盐值 |
+| `cleaning/cleaning_summary.json` | 清洗前后数量、分原因删除数、用户数和 post/comment 数 |
+| `cleaning/cleaned_posts.csv` | 清理和去重后的输入 |
+| `records/post_extractions_en.csv` / `_zh.csv` | 每条成功记录的暴露组列表，英文/中文版 |
+| `records/exposure_records_en.csv` / `_zh.csv` | 每条记录拆分后的 regimen 明细，英文/中文版 |
+| `records/adverse_events_en.csv` / `_zh.csv` | 各 regimen 下的不良反应明细，中文版同时保留英文 PT |
+| `tables/exposure_group_summary_en.csv` / `_zh.csv` | 各暴露组的记录数、暴露用户数和症状报告用户数 |
+| `tables/pt_frequency_by_group_en.csv` / `_zh.csv` | 各暴露组按独立用户去重的 PT 频数及两种分母百分比 |
+| `tables/appendix_table_1_symptom_pairs_zh.csv` | 仿原文附录表 1：任意目标药物暴露用户中的两种中文症状共现；分母为全部确认暴露的去重用户 |
+| `tables/appendix_table_2_exclusive_single_drug_zh.csv` | 仿原文附录表 2：全程仅识别到一种目标药物的用户中，各中文症状人数与各单药组比例；列标题标明各组分母 |
 | `charts/en/<single|combinations>/*.png` | 英文版单药/联合用药前十症状图 |
 | `charts/zh/<single|combinations>/*.png` | 中文版单药/联合用药前十症状图 |
 
 `percent_of_exposed_users` 的分母是该暴露组全部用户，`percent_of_event_reporters` 的分母是该组中至少报告一项不良反应的用户。两者都不是药物不良反应的临床发生率。
+
+新增两张附录风格表只输出中文 CSV，原有中英双语明细、暴露组表和图仍照常保留。两表都按去标识化用户去重；同一用户报告三个症状时可计入三个不同症状对。表 1 将少于全部暴露用户 0.5% 的症状对省略。表 2 只纳入在全部成功记录里始终属于同一种目标药物单药组的用户：曾被识别为使用其他目标药物、换药或同期联合用药的用户不进入这张单药对照表；显示任一单药组达到 0.5% 的症状行。百分比的分母包含该组未报告症状的用户。中文版按模型生成的中文辅助释义归并同名症状，英文候选 PT 拼写不同但中文同名时按用户合并。它不能代替经授权 MedDRA 词表校验的官方 PT 统计，也不能用于推断临床发生率。
 
 ## Reddit 数据与合规
 
@@ -266,7 +340,64 @@ Study A 内置了达格列净、恩格列净、卡格列净和艾托格列净的
 
 ## 给后续 Agent 的工作约定
 
-如果你是继续维护该项目的 Agent，请先完整阅读本 README、`PROJECT_REPORT_SOURCE.md` 和 `pharmacovigilance_pipeline.py`，再开始修改。凡是影响研究范围、数据状态、流程、统计口径或汇报叙事的改动，都必须同步更新 `PROJECT_REPORT_SOURCE.md` 的日期、状态和变更记录。
+如果你是继续维护该项目的 Agent，请先完整阅读本 README、`PROJECT_REPORT_SOURCE.md`、`download_reddit_data.py` 和 `pharmacovigilance_pipeline.py`，再开始修改。凡是影响研究范围、数据状态、流程、统计口径或汇报叙事的改动，都必须同步更新 `PROJECT_REPORT_SOURCE.md` 的日期、状态和变更记录。
+
+### 从新研究到最终表图：Agent 逐步操作流程
+
+以下是**给 Agent 的交接顺序**，不是让用户一次执行所有命令。每完成一步，先核验文件与数量、向用户报告，再给出下一条命令。Study A 已完成；当前 Study B 已完成第 1–8 步，包括正式召回、评论下载、本地清洗与 100 条付费模型小样本，**尚未运行全量模型分析**。本次 100 条恰好未包含 Inclisiran，只能验证运行路径，不能证明第三种药的抽取效果；已核验数字见 `PROJECT_REPORT_SOURCE.md`。所有命令都从项目根目录运行；用户本机可在已有的 `pytorch` conda 环境中运行，但 README 不要求其他机器也有这个环境。
+
+1. **固定研究配置。** 与用户确认标准药物名、社区、UTC 半开时间窗、别名文件、数据目录和分析目录；不要把“研究包含三种药物”理解为“要求三药同时使用”。每项研究使用独立输出目录，避免 Study A 的召回 manifest、评论和模型 checkpoint 混入 Study B。Study B 使用 `evolocumab alirocumab inclisiran`、上述 5 个社区、`study_b_drug_aliases.json`、`data/reddit/study_b/` 和 `output/study_b_analysis/`。
+2. **先给 posts 下载计划，再下载。** 给用户本 README「Study B：下载近十年帖子」中的命令，先加 `--dry-run` 核对社区与年度切片；用户确认后去掉 `--dry-run`，保留 `--kinds posts` 开始下载。不要直接下载整个社区的 comments。长任务由用户在终端观察进度；不要在未经请求时替用户启动。按一次 `Ctrl+C` 后原命令续传。
+3. **核验 posts 并记录报告。** 检查每个预期 `.state.json` 的 `complete`、`count`，核对对应 JSONL 文件的实际行数和 post ID 去重情况，按社区汇总；不能仅凭终端显示 `finished` 宣称下载完整。将时间窗、社区、切片数和原始帖子数写入 `PROJECT_REPORT_SOURCE.md`，明确这些不是有效用药人数。
+4. **只读预览药名召回。** 使用上文 Study B 定向评论命令的 `--dry-run` 版本，必须包含 `--drug-alias-file study_b_drug_aliases.json`，且不要加 `--include-class-only`。向用户报告范围内 posts、候选 posts、按社区/药物分布、预计评论规模及模糊命中可能带来的误召回；此时既没有 manifest，也没有评论下载。Study B 已预览到 52,753 条原始帖中的 1,242 条候选帖，详见 report。
+5. **用户确认后正式召回并下载评论。** 给用户上文 Study B 的正式定向评论命令，起始并发建议 `--targeted-comment-workers 8`。该命令会先写 `recalled_posts.jsonl`、`recall_summary.json`，**随后立即开始**按 post ID 下载评论，不是“只生成名单”。中断后使用原命令续跑会复用 manifest。若日期、社区、别名或规则改变，先说明原 manifest 不再兼容，优先新建输出目录；不要在旧目录静默混用或随意加 `--refresh-recall`。
+6. **核验评论并更新报告。** 检查目标 post 数、完成/未完成线程、各 `.state.json` 的 `count` 与 JSONL 行数、唯一 comment ID 和 `link_id` 对应的 post ID；从正式 `recall_summary.json` 记录召回率及分组数。不要把帖子的 `num_comments` 合计当成实际下载的评论条数，也不要把药名提及当作本人用药。
+7. **只做本地清洗。** 评论完整后，先执行下方 Study B `--prepare-only` 命令，检查 `cleaning/cleaning_summary.json` 和 `cleaning/cleaned_posts.csv` 的前后数量、去重和用户伪名化情况。此步不需要模型余额，也不调用 DeepSeek；发现输入异常时先停下来解释，不应直接进入付费模型步骤。
+8. **独立小样本模型测试。** 用户准备好根目录 `.env` 后，在独立的 `output/study_b_test100/` 用 `--limit 100 --concurrency 10` 测试；检查结构化输出、本人用药/换药/联合用药口径、中文术语和图表。不要把测试目录当作全量结果。向用户说明预计数据量与 API 费用风险，得到确认后才给全量命令。
+9. **全量分析、续传、出表。** 全量使用固定的 `output/study_b_analysis/` 与相同输入、药物顺序、模型配置；`--concurrency 150` 是当前示例值，若服务限流明显可以调低。中断后原命令会复用兼容的模型 checkpoint，但普通续跑仍重新执行本地清洗；不要用 `--restart` 作为常规续传。只需从已导出的明细重算两张中文附录表时才使用 `--tables-only`，它不会重新清洗、请求模型或重画全部图表。
+10. **核验并汇报最终口径。** 分别报告原始帖、召回帖、实际评论、清洗后记录、模型成功/失败、本人目标药物暴露、报告症状的用户/记录、实际观察到的单药与同期联合组、API token/费用。检查 `records/`、`tables/`、`charts/` 的输出，更新 report；明确 Reddit 自报和模型分类不是临床验证，任何百分比都不能称为真实不良反应发生率。
+
+Study B 在第 7–9 步需要用到的命令如下；只有前一步核验通过、用户希望继续时才给出下一条。先本地清洗：
+
+```powershell
+python pharmacovigilance_pipeline.py `
+  --input data/reddit/study_b/targeted_comments `
+  --output-dir output/study_b_analysis `
+  --target-drugs evolocumab alirocumab inclisiran `
+  --prepare-only
+```
+
+再在独立目录做付费 API 小样本测试：
+
+```powershell
+python pharmacovigilance_pipeline.py `
+  --input data/reddit/study_b/targeted_comments `
+  --output-dir output/study_b_test100 `
+  --target-drugs evolocumab alirocumab inclisiran `
+  --limit 100 `
+  --concurrency 10 `
+  --min-chart-users 1
+```
+
+确认后再跑全量，`--meddra-pt` 和 `--drug-labels-zh` 可按本机授权词表及中文展示需求另加，不能凭空假定文件存在：
+
+```powershell
+python pharmacovigilance_pipeline.py `
+  --input data/reddit/study_b/targeted_comments `
+  --output-dir output/study_b_analysis `
+  --target-drugs evolocumab alirocumab inclisiran `
+  --concurrency 150 `
+  --min-chart-users 5
+```
+
+若全量已导出且仅需重算两张中文附录表：
+
+```powershell
+python pharmacovigilance_pipeline.py `
+  --tables-only `
+  --output-dir output/study_b_analysis `
+  --target-drugs evolocumab alirocumab inclisiran
+```
 
 ### 修改原则
 
