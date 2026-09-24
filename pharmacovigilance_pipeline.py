@@ -248,6 +248,15 @@ def parse_args() -> argparse.Namespace:
         help="Clean and normalize the input without calling the model.",
     )
     parser.add_argument(
+        "--append-only",
+        action="store_true",
+        help=(
+            "Reuse an existing model checkpoint when new direct-recalled "
+            "comments have only been appended. Verify the old cleaned prefix "
+            "and request the model only for newly appended rows."
+        ),
+    )
+    parser.add_argument(
         "--tables-only",
         action="store_true",
         help=(
@@ -553,7 +562,71 @@ def load_input(path: Path, output_dir: Path) -> pd.DataFrame:
     if not path.exists():
         raise FileNotFoundError(path)
     if path.is_dir():
-        return load_targeted_reddit_input(path, output_dir)
+        frames = []
+        legacy_manifest = path / "recalled_posts.jsonl"
+        if legacy_manifest.exists():
+            frames.append(load_targeted_reddit_input(path, output_dir))
+        for kind in ("posts", "comments"):
+            direct_dir = path / f"direct_{kind}"
+            if (direct_dir / "search_config.json").exists():
+                manifest_path = direct_dir / "manifest.json"
+                if not manifest_path.exists() or not json.loads(
+                    manifest_path.read_text(encoding="utf-8")
+                ).get("complete"):
+                    raise RuntimeError(
+                        f"Direct {kind} search is incomplete; finish the downloader first"
+                    )
+                if not (direct_dir / f"verified_{kind}.jsonl").exists():
+                    raise FileNotFoundError(direct_dir / f"verified_{kind}.jsonl")
+        journal = path / "direct_records.jsonl"
+        if journal.exists():
+            salt = load_or_create_user_hash_salt(output_dir)
+            rows = []
+            seen = set()
+            for entry in read_jsonl_records(journal):
+                kind = entry.get("kind")
+                record = entry.get("record")
+                if kind not in {"post", "comment"} or not isinstance(record, dict):
+                    raise ValueError(f"Invalid direct-record journal entry: {journal}")
+                ident = normalize_whitespace(record.get("id"))
+                if not ident:
+                    raise ValueError(f"Direct-record journal contains an empty ID: {journal}")
+                record_id = f"{kind}:{ident}"
+                if record_id in seen:
+                    raise ValueError(f"Duplicate direct-record journal ID: {record_id}")
+                seen.add(record_id)
+                message = (
+                    "\n\n".join(part for part in (
+                        normalize_whitespace(record.get("title")),
+                        normalize_whitespace(record.get("selftext")),
+                    ) if part)
+                    if kind == "post" else normalize_whitespace(record.get("body"))
+                )
+                rows.append({
+                    "record_id": record_id,
+                    "user_id": hash_reddit_author(record.get("author"), salt),
+                    "message": message[:MAX_MESSAGE_CHARS],
+                    "context": "",
+                    "source_type": kind,
+                    "thread_id": (ident if kind == "post" else
+                                  normalize_whitespace(record.get("link_id")).removeprefix("t3_")),
+                    "parent_id": ("" if kind == "post" else
+                                  normalize_whitespace(record.get("parent_id"))),
+                    "subreddit": normalize_whitespace(record.get("subreddit")),
+                    "created_utc": record.get("created_utc", ""),
+                    "date": utc_iso(record.get("created_utc")),
+                    "recalled_target_drugs": json.dumps(
+                        record.get("matched_target_drugs", []), ensure_ascii=False
+                    ),
+                })
+            if rows:
+                frames.append(pd.DataFrame(rows))
+        if not frames:
+            raise ValueError(
+                "Input directory needs the legacy recall manifest or a "
+                "completed direct keyword search"
+            )
+        return pd.concat(frames, ignore_index=True)
     suffix = path.suffix.lower()
     if suffix == ".csv":
         return pd.read_csv(path, dtype=str, keep_default_na=False)
@@ -1781,6 +1854,50 @@ def run_pipeline_locked(
     cleaned_before_limit = len(cleaned)
     if args.limit is not None:
         cleaned = cleaned.head(args.limit).copy()
+    append_boundary = 0
+    saved_checkpoint_metadata = None
+    if args.append_only:
+        if args.restart or args.limit is not None:
+            raise ValueError("--append-only cannot use --restart or --limit")
+        cleaned_path = output_dir / "cleaning" / "cleaned_posts.csv"
+        if not checkpoint_metadata_path.exists() or not results_path.exists():
+            raise RuntimeError(
+                "--append-only requires the existing model checkpoint and metadata"
+            )
+        saved_checkpoint_metadata = json.loads(
+            checkpoint_metadata_path.read_text(encoding="utf-8")
+        )
+        if saved_checkpoint_metadata.get("target_drugs") != target_drugs:
+            raise RuntimeError("--append-only target drugs differ from the old checkpoint")
+        if (saved_checkpoint_metadata.get("prompt_version") != PROMPT_VERSION
+                or saved_checkpoint_metadata.get("prompt_sha256") != hashlib.sha256(
+                    build_system_prompt(target_drugs).encode("utf-8")
+                ).hexdigest()):
+            raise RuntimeError("--append-only prompt differs from the old checkpoint")
+        if not args.prepare_only:
+            config = load_model_config()
+            if (saved_checkpoint_metadata.get("model_url") != config.model_url
+                    or saved_checkpoint_metadata.get("model_name") != config.model_name):
+                raise RuntimeError("--append-only model differs from the old checkpoint")
+        old_count = int(saved_checkpoint_metadata["cleaned_rows"])
+        old_fingerprint = saved_checkpoint_metadata["input_fingerprint"]
+        if len(cleaned) < old_count or dataframe_fingerprint(cleaned.iloc[:old_count]) != old_fingerprint:
+            raise RuntimeError(
+                "New input does not preserve the existing cleaned-row prefix; "
+                "refusing to reuse the model checkpoint"
+            )
+        if not cleaned_path.exists():
+            raise FileNotFoundError(cleaned_path)
+        previous = pd.read_csv(cleaned_path, dtype=str, keep_default_na=False)
+        if len(previous) < old_count or dataframe_fingerprint(previous.iloc[:old_count]) != old_fingerprint:
+            raise RuntimeError("Stored cleaned CSV disagrees with checkpoint metadata")
+        append_boundary = int(
+            saved_checkpoint_metadata.get("append_only_origin_rows", old_count)
+        )
+        if not 0 <= append_boundary <= old_count:
+            raise RuntimeError("Invalid append-only boundary in checkpoint metadata")
+        print(f"Append-only: preserving first {append_boundary:,} original model rows; "
+              f"{len(cleaned)-append_boundary:,} supplemental rows eligible")
     write_csv_atomic(cleaned, output_dir / "cleaning" / "cleaned_posts.csv")
 
     source_counts = (
@@ -1850,11 +1967,14 @@ def run_pipeline_locked(
         "model_name": config.model_name,
     }
     if checkpoint_metadata_path.exists():
-        saved = json.loads(checkpoint_metadata_path.read_text(encoding="utf-8"))
+        saved = saved_checkpoint_metadata or json.loads(
+            checkpoint_metadata_path.read_text(encoding="utf-8")
+        )
         mismatches = [
             key
             for key, expected in expected_checkpoint_metadata.items()
             if saved.get(key) != expected
+            and (not args.append_only or key not in {"input_fingerprint", "cleaned_rows"})
         ]
         if mismatches:
             raise RuntimeError(
@@ -1862,6 +1982,10 @@ def run_pipeline_locked(
                 f"({', '.join(mismatches)}). Use a new --output-dir or pass "
                 "--restart to explicitly discard the old model checkpoint."
             )
+        if args.append_only:
+            expected_checkpoint_metadata["append_only_origin_rows"] = append_boundary
+            if saved != expected_checkpoint_metadata:
+                atomic_write_json(checkpoint_metadata_path, expected_checkpoint_metadata)
     elif results_path.exists() and results_path.stat().st_size:
         raise RuntimeError(
             "Found extractions.jsonl without checkpoint_metadata.json. Use a "
@@ -1874,7 +1998,7 @@ def run_pipeline_locked(
 
     asyncio.run(
         run_extraction(
-            cleaned,
+            cleaned.iloc[append_boundary:].copy() if args.append_only else cleaned,
             results_path=results_path,
             concurrency=args.concurrency,
             target_drugs=target_drugs,
@@ -1932,7 +2056,7 @@ def run_pipeline_locked(
 
 def main() -> None:
     args = parse_args()
-    if args.tables_only and (args.prepare_only or args.restart or args.limit):
+    if args.tables_only and (args.prepare_only or args.restart or args.limit or args.append_only):
         raise ValueError(
             "--tables-only cannot be combined with --prepare-only, "
             "--restart, or --limit"
