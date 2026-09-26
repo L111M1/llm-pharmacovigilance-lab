@@ -217,6 +217,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--recall-only",
+        action="store_true",
+        help=(
+            "Save the local recalled-post manifest and summary, then stop "
+            "without downloading comments. Requires --targeted-comments-from-posts."
+        ),
+    )
+    parser.add_argument(
         "--drug-alias-file",
         type=Path,
         help=(
@@ -1969,6 +1977,9 @@ def run_targeted_comment_mode(args: argparse.Namespace) -> None:
         )
         print(f"Recall manifest: {manifest}")
         print(f"Recall summary:  {summary}")
+    if args.recall_only:
+        print("Recall-only complete; no comments were downloaded.")
+        return
     print(
         f"Downloading {len(posts):,} comment threads with "
         f"{args.targeted_comment_workers} workers. "
@@ -1991,6 +2002,8 @@ def run_targeted_comment_mode(args: argparse.Namespace) -> None:
 
 def main() -> None:
     args = parse_args()
+    if args.recall_only and args.targeted_comments_from_posts is None:
+        raise ValueError("--recall-only requires --targeted-comments-from-posts")
     if not 1 <= args.page_size <= 100:
         raise ValueError("--page-size must be between 1 and 100")
     if args.request_delay < 0:

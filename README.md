@@ -87,6 +87,8 @@ python download_reddit_data.py `
 
 核对召回帖数、各社区/药物分布和疑似错拼。Study B 不加 `--include-class-only`。召回只是候选筛选：**只在评论里提到药物、而原帖完全未命中的讨论串不会进入本次评论下载**。
 
+确认预览后，将命令末尾的 `--dry-run` 改为 `--recall-only`，即可保存 `recalled_posts.jsonl` 和 `recall_summary.json` 后停止，**不开始下载评论**。下一步运行评论命令时会复用这份名单。
+
 ### 4. 保存召回名单并下载候选帖评论
 
 这条命令先写 `recalled_posts.jsonl`、`recall_summary.json`，**随后立即**按 post ID 并行下载对应的完整评论线程：
@@ -103,6 +105,16 @@ python download_reddit_data.py `
 ```
 
 中断后原命令续传会复用候选名单，跳过已完成线程。核对所有线程状态、评论 JSONL 行数与 state `count`、唯一评论 ID；`recall_summary.json` 的帖子 `num_comments` 合计只是预估，不是实际下载量。若修改日期、社区或别名，请使用**新的输出目录**，不要混用旧 manifest。
+
+如需在完整讨论串下载后**只保留正文自身命中目标药名的评论**进入模型，可额外运行本地评论召回。例如 GLP-1 原论文复刻数据：
+
+```powershell
+python recall_downloaded_comments.py `
+  --input-dir data/reddit/study_glp1_paper/targeted_comments `
+  --drug-alias-file data/reddit/study_glp1_paper/drug_aliases.local.json
+```
+
+此命令只读已下载的完整评论文件，沿用原帖召回的精确别名和长词 ≥80% 编辑相似度规则，检查评论**正文自身**，不把父评论或原帖药名当作该评论的命中证据；不联网、不调用模型。全部讨论串必须已完成，原始评论文件不会修改。结果写入同一目录的 `recalled_comments.jsonl` 和 `combined_recall_summary.json`，后者列出召回帖子、扫描评论、命中评论、帖子＋评论合计及社区/药物分组。存在这两个文件时，后续 `pharmacovigilance_pipeline.py --input` 会只纳入召回帖子与命中评论，但仍从完整评论串提取父级上下文。只靠上下文指代药物、评论正文未出现药名的回复会被排除；模糊匹配也可能误召回普通词，应抽查结果。该本地扫描中断后重跑同一命令即可，最终结果采用临时文件完成后替换。
 
 ### 5. 只做本地清洗
 

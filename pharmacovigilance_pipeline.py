@@ -438,6 +438,45 @@ def load_targeted_reddit_input(path: Path, output_dir: Path) -> pd.DataFrame:
     if "" in manifest_by_id or len(manifest_by_id) != len(manifest):
         raise ValueError("Recall manifest has empty or duplicate post IDs")
 
+    comment_manifest_path = path / "recalled_comments.jsonl"
+    combined_summary_path = path / "combined_recall_summary.json"
+    if comment_manifest_path.exists() != combined_summary_path.exists():
+        raise RuntimeError(
+            "Comment recall requires both recalled_comments.jsonl and "
+            "combined_recall_summary.json; rerun recall_downloaded_comments.py"
+        )
+    selected_comments: dict[str, dict[str, Any]] | None = None
+    if comment_manifest_path.exists():
+        combined_summary = json.loads(
+            combined_summary_path.read_text(encoding="utf-8")
+        )
+        expected_hash = combined_summary.get("parameters", {}).get(
+            "post_manifest_sha256"
+        )
+        actual_hash = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+        if expected_hash != actual_hash:
+            raise RuntimeError(
+                "Comment recall belongs to a different post manifest; "
+                "rerun recall_downloaded_comments.py"
+            )
+        selected_comments = {}
+        for item in read_jsonl_records(comment_manifest_path):
+            comment_id = normalize_whitespace(item.get("comment_id"))
+            if not comment_id or comment_id in selected_comments:
+                raise ValueError("Comment recall has an empty/duplicate comment ID")
+            if normalize_whitespace(item.get("post_id")) not in manifest_by_id:
+                raise ValueError(
+                    f"Comment recall references an unknown post: {comment_id}"
+                )
+            selected_comments[comment_id] = item
+        expected_count = int(
+            combined_summary.get("results", {}).get("recalled_comments", -1)
+        )
+        if len(selected_comments) != expected_count:
+            raise RuntimeError(
+                "Comment recall manifest count differs from its summary"
+            )
+
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
     configured_root = Path(
         summary.get("parameters", {}).get("posts_root", "")
@@ -480,6 +519,7 @@ def load_targeted_reddit_input(path: Path, output_dir: Path) -> pd.DataFrame:
 
     salt = load_or_create_user_hash_salt(output_dir)
     rows: list[dict[str, Any]] = []
+    loaded_selected_comments: set[str] = set()
     for post_id, manifest_item in manifest_by_id.items():
         post = posts_by_id[post_id]
         title = normalize_whitespace(post.get("title"))
@@ -518,6 +558,18 @@ def load_targeted_reddit_input(path: Path, output_dir: Path) -> pd.DataFrame:
         }
         for comment in comments:
             comment_id = normalize_whitespace(comment.get("id"))
+            selected_match = (
+                selected_comments.get(comment_id)
+                if selected_comments is not None else None
+            )
+            if selected_comments is not None and selected_match is None:
+                continue
+            if selected_match is not None:
+                if normalize_whitespace(selected_match.get("post_id")) != post_id:
+                    raise ValueError(
+                        f"Comment recall post mismatch: {comment_id}"
+                    )
+                loaded_selected_comments.add(comment_id)
             rows.append(
                 {
                     "record_id": f"comment:{comment_id}",
@@ -541,11 +593,23 @@ def load_targeted_reddit_input(path: Path, output_dir: Path) -> pd.DataFrame:
                     "created_utc": comment.get("created_utc", ""),
                     "date": utc_iso(comment.get("created_utc")),
                     "recalled_target_drugs": json.dumps(
-                        manifest_item.get("matched_target_drugs", []),
+                        (
+                            selected_match.get("matched_target_drugs", [])
+                            if selected_match is not None else
+                            manifest_item.get("matched_target_drugs", [])
+                        ),
                         ensure_ascii=False,
                     ),
                 }
             )
+    if selected_comments is not None and len(loaded_selected_comments) != len(
+        selected_comments
+    ):
+        missing = set(selected_comments) - loaded_selected_comments
+        raise RuntimeError(
+            f"Missing {len(missing):,} recalled comments in downloaded data; "
+            f"examples: {', '.join(sorted(missing)[:5])}"
+        )
     return pd.DataFrame(rows)
 
 
